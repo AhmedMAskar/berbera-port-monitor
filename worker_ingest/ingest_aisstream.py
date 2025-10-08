@@ -1,8 +1,15 @@
-import os, json, asyncio, websockets, psycopg2
+import os, json, asyncio, websockets, psycopg2, time
 from datetime import datetime, timezone
 
-AISS_API_KEY = os.environ.get("AISS_API_KEY")
-DATABASE_URL = os.environ.get("DATABASE_URL")
+# --- Clean and validate secrets ---
+AISS_API_KEY = (os.environ.get("AISS_API_KEY") or "").strip().strip('"').strip("'")
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip().strip('"').strip("'")
+
+if not AISS_API_KEY:
+    raise SystemExit("❌ AISS_API_KEY is missing. Set it in GitHub → Settings → Secrets → Actions.")
+if not DATABASE_URL:
+    raise SystemExit("❌ DATABASE_URL is missing. Set it in GitHub → Settings → Secrets → Actions.")
+
 
 # Tight bbox around Berbera (tune as needed): [minLon, minLat, maxLon, maxLat]
 BBOX = [44.95, 10.35, 45.10, 10.50]
