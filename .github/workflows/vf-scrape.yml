@@ -1,0 +1,36 @@
+name: Scrape VesselFinder (daily)
+on:
+  schedule:
+    - cron: "13 8 * * *"   # daily at 08:13 UTC
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      - name: Run scraper
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          S3_BUCKET:    ${{ secrets.S3_BUCKET }}
+        run: |
+          python scripts/vf_scrape.py
+
+      - name: Upload CSVs as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vf-snapshots
+          path: data/vf_snapshots/**
