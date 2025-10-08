@@ -13,12 +13,11 @@ if not DATABASE_URL:
     raise SystemExit("❌ DATABASE_URL is missing. Set it in GitHub → Settings → Secrets → Actions.")
 
 # Bounding box around Berbera: [minLon, minLat, maxLon, maxLat]
-# If you see little/no data during the 120s window, temporarily widen it, e.g.:
+# If you see little/no data during the window, temporarily widen it, e.g.:
 # BBOX = [44.5, 10.0, 45.5, 11.0]
-#BBOX = [44.95, 10.35, 45.10, 10.50]# go back to this bbox-after reliable data test
-BBOX = [44.5, 10.0, 45.5, 11.0]   # wider area around Berbera
-# Run each Action for ~2 minutes so jobs don't overlap
-#RUN_SECONDS = 120
+BBOX = [44.95, 10.35, 45.10, 10.50]
+
+# Run each Action for ~10 minutes so we actually collect a chunk
 RUN_SECONDS = 600
 
 async def main():
@@ -38,9 +37,19 @@ async def main():
     who, db = cur.fetchone()
     print(f"✅ DB connected as user={who}, db={db}")
 
-    # Optional: confirm we can insert by checking sequence perms (read-only probe)
-    cur.execute("SELECT 1;")
-    print("✅ DB probe ok")
+    # Ensure 'ships' table exists for static data
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS ships (
+          mmsi        bigint PRIMARY KEY,
+          shipname    text,
+          callsign    text,
+          imo         bigint,
+          shiptype    text,
+          destination text,
+          updated_at  timestamptz NOT NULL DEFAULT now()
+        );
+    """)
+    print("✅ Verified 'ships' table exists")
 
     start = time.time()
 
@@ -68,7 +77,38 @@ async def main():
                 print("⚠️ JSON parse error:", repr(e))
                 continue
 
-            if msg.get("MessageType") == "PositionReport":
+            mtype = msg.get("MessageType")
+
+            # -------- ShipStaticData: upsert into 'ships' --------
+            if mtype == "ShipStaticData":
+                s = msg.get("Message", {})
+                mmsi  = s.get("UserID")
+                name  = s.get("Name")
+                calls = s.get("CallSign")
+                imo   = s.get("IMO")
+                stype = s.get("ShipType")      # e.g., "Cargo"
+                dest  = s.get("Destination")
+
+                if mmsi:
+                    try:
+                        cur.execute("""
+                            INSERT INTO ships (mmsi, shipname, callsign, imo, shiptype, destination, updated_at)
+                            VALUES (%s,%s,%s,%s,%s,%s, now())
+                            ON CONFLICT (mmsi) DO UPDATE
+                            SET shipname=EXCLUDED.shipname,
+                                callsign=EXCLUDED.callsign,
+                                imo=EXCLUDED.imo,
+                                shiptype=EXCLUDED.shiptype,
+                                destination=COALESCE(EXCLUDED.destination, ships.destination),
+                                updated_at=now();
+                        """, (mmsi, name, calls, imo, stype, dest))
+                    except Exception as e:
+                        print("❌ UPSERT ships failed:", repr(e))
+                        raise
+                continue  # done with this message
+
+            # -------- PositionReport: insert into 'ais_positions' --------
+            if mtype == "PositionReport":
                 d = msg.get("Message", {})
                 mmsi = d.get("UserID")
                 lat  = d.get("Latitude")
@@ -95,10 +135,8 @@ async def main():
                     )
                 except Exception as e:
                     # Print the exact DB error so Actions logs show what's wrong
-                    print("❌ INSERT failed:", repr(e))
+                    print("❌ INSERT ais_positions failed:", repr(e))
                     raise
-
-            # You can add handling for "ShipStaticData" later if you want IMO/name, etc.
 
     # Clean close (optional; autocommit enabled)
     try:
