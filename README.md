@@ -1,4 +1,4 @@
-# Berbera Port Monitor (Free AIS → Postgres → Streamlit)
+# Berbera Port Monitor (AIS api → Postgres → Streamlit)
 
 Live KPIs for Berbera (SOBBO): inbound, alongside, departures, queue/wait, weekly/monthly, and YoY.
 
