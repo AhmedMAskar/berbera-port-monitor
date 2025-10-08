@@ -15,10 +15,11 @@ if not DATABASE_URL:
 # Bounding box around Berbera: [minLon, minLat, maxLon, maxLat]
 # If you see little/no data during the 120s window, temporarily widen it, e.g.:
 # BBOX = [44.5, 10.0, 45.5, 11.0]
-BBOX = [44.95, 10.35, 45.10, 10.50]
-
+#BBOX = [44.95, 10.35, 45.10, 10.50]# go back to this bbox-after reliable data test
+BBOX = [44.5, 10.0, 45.5, 11.0]   # wider area around Berbera
 # Run each Action for ~2 minutes so jobs don't overlap
-RUN_SECONDS = 120
+#RUN_SECONDS = 120
+RUN_SECONDS = 600
 
 async def main():
     uri = "wss://stream.aisstream.io/v0/stream"
