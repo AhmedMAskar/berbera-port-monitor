@@ -1,6 +1,11 @@
+# worker_detect/detect_events.py
+
 import os, psycopg2
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
+# --- Clean and validate secret from GitHub Actions env ---
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip().strip('"').strip("'")
+if not DATABASE_URL:
+    raise SystemExit("❌ DATABASE_URL is missing. Set it in GitHub → Settings → Secrets → Actions.")
 
 SQL_RECENT = """
 WITH port AS (SELECT geom FROM geofences WHERE id='berbera_port'),
@@ -21,14 +26,13 @@ FROM latest l;
 """
 
 def main():
-    assert DATABASE_URL, "Missing DATABASE_URL"
     conn = psycopg2.connect(DATABASE_URL)
     conn.autocommit = True
     cur = conn.cursor()
 
     cur.execute(SQL_RECENT)
     for mmsi, ts, sog, nav, in_port, in_anch in cur.fetchall():
-        # Check open port call
+        # Is there an open (not departed) call?
         cur.execute(
             "SELECT id FROM port_calls WHERE mmsi=%s AND departure_at IS NULL ORDER BY arrival_at DESC LIMIT 1",
             (mmsi,)
@@ -56,6 +60,7 @@ def main():
                     (mmsi, mmsi)
                 )
         else:
+            # If moved out of port and is making way, close the call
             if open_call and sog > 1.0:
                 cur.execute("UPDATE port_calls SET departure_at = now() WHERE id=%s", (open_call[0],))
 
