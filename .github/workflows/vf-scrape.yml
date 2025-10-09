@@ -1,16 +1,20 @@
-name: Scrape VesselFinder (daily)
+name: Scrape VesselFinder (4x daily)
+
 on:
   schedule:
-    - cron: "13 8 * * *"   # daily at 08:13 UTC
-  workflow_dispatch:
+    # Runs at 00:13, 06:13, 12:13, and 18:13 UTC every day
+    - cron: "13 0,6,12,18 * * *"
+  workflow_dispatch: {}    # Allow manual run from the Actions tab
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -20,12 +24,13 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # Keep your requirements here
           pip install -r scripts/requirements.txt
 
-      - name: Run scraper
+      - name: Run VesselFinder scraper
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          S3_BUCKET:    ${{ secrets.S3_BUCKET }}
+          S3_BUCKET:    ${{ secrets.S3_BUCKET }}   # optional
         run: |
           python scripts/vf_scrape.py
 
