@@ -2,19 +2,19 @@ name: Scrape VesselFinder (4x daily)
 
 on:
   schedule:
-    # Runs at 00:13, 06:13, 12:13, and 18:13 UTC every day
     - cron: "13 0,6,12,18 * * *"
-  workflow_dispatch: {}    # Allow manual run from the Actions tab
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -24,18 +24,27 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          # Keep your requirements here
           pip install -r scripts/requirements.txt
 
-      - name: Run VesselFinder scraper
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          S3_BUCKET:    ${{ secrets.S3_BUCKET }}   # optional
-        run: |
-          python scripts/vf_scrape.py
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
 
+      - name: Run VesselFinder scraper (writes latest+history locally & uploads to S3)
+        env:
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_PREFIX: ${{ secrets.S3_PREFIX }}   # e.g., "berbera"  (optional)
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: python scripts/vf_scrape.py
+
+      # optional artifact for quick debugging
       - name: Upload CSVs as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: vf-snapshots
-          path: data/vf_snapshots/**
+          path: |
+            data/vf_snapshot.csv
+            data/vf_snapshots/**
