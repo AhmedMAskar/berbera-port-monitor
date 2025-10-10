@@ -1,15 +1,18 @@
+# scripts/vf_scrape.py
 """
-VesselFinder scraper runner (schedule is controlled by GitHub Actions YAML).
+VesselFinder scraper runner (schedule controlled by GitHub Actions).
 
-What this script does:
-- Runs your scraping function (replace the TODO block with your real logic).
-- Writes a timestamped CSV into data/vf_snapshots/
-- Also writes/overwrites data/vf_snapshots/latest.csv
-- Optionally uploads to S3 if S3_BUCKET is set (requires boto3 in requirements).
+Outputs:
+- data/vf_snapshot.csv                           (rolling latest)
+- data/vf_snapshots/vf_snapshot_<TS>.csv         (history)
+Uploads to S3 (if S3_BUCKET set):
+- s3://<bucket>/<prefix>/latest/vf_snapshot.csv
+- s3://<bucket>/<prefix>/history/csv/YYYY/MM/DD/HHmm/vf_snapshot_<TS>.csv
 
-Env vars expected (via GitHub Actions secrets or your local env):
-- DATABASE_URL  (optional – if your scraper uses a database)
-- S3_BUCKET     (optional – for S3 upload)
+Env:
+- S3_BUCKET  (required for S3 upload)
+- S3_PREFIX  (optional; default: "berbera")
+- AWS_REGION (optional; boto3 will still work if omitted)
 """
 
 import os
@@ -19,113 +22,104 @@ import datetime as dt
 from pathlib import Path
 
 try:
-    import pandas as pd  # recommended; add to scripts/requirements.txt
+    import pandas as pd
 except Exception:
     pd = None
 
-# Optional S3 upload (requires boto3 in scripts/requirements.txt)
-def _try_s3_upload(local_path: Path, bucket: str, s3_key: str) -> None:
-    try:
-        import boto3
-        s3 = boto3.client("s3")
-        s3.upload_file(str(local_path), bucket, s3_key)
-        print(f"✅ Uploaded to s3://{bucket}/{s3_key}")
-    except Exception as e:
-        print(f"⚠️ S3 upload skipped/failed: {e}")
-
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-
+# ------------------------------
+# Demo stub: replace with real scrape
+# ------------------------------
 def scrape_vesselfinder():
     """
     TODO: Replace this stub with your real scraping logic.
-    Must return a list of dicts (or a pandas DataFrame) with consistent columns.
-    Example columns: ts_utc, vessel_name, imo, status, yard, source
+    Must return a list[dict] or pandas.DataFrame with consistent columns.
     """
     now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
     rows = [
         {
-            "ts_utc": now,
-            "vessel_name": "Demo Vessel",
-            "imo": "1234567",
-            "status": "scrapped",
-            "yard": "Demo Yard",
+            "scraped_at_utc": now,
+            "name": "Demo Vessel",
+            "mmsi": "123456789",
+            "ship_type": "General Cargo",
+            "status": "in_port",  # or incoming/outgoing/expected
+            "last_port": "Aden",
+            "distance_nm_to_berbera": 0.3,
+            "eta_to_berbera_utc": None,
+            "speed_kn": 0.0,
             "source": "VesselFinder",
         }
     ]
     return rows
 
+# ------------------------------
+# Helpers
+# ------------------------------
+def _ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
 def to_dataframe(data):
-    """Normalize to pandas DataFrame (or CSV rows) without breaking if pandas missing."""
     if pd is not None:
         return pd.DataFrame(data)
-    return data  # will be handled by csv module
+    return data
 
 def write_outputs(df_or_rows, out_dir: Path) -> tuple[Path, Path]:
-    """Write timestamped CSV and latest.csv. Returns (timestamped_path, latest_path)."""
     _ensure_dir(out_dir)
-    ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%SZ")
-    ts_csv = out_dir / f"vf_{ts}.csv"
-    latest_csv = out_dir / "latest.csv"
+    ts = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts_csv = out_dir / f"vf_snapshot_{ts}.csv"
+    latest_csv = Path("data") / "vf_snapshot.csv"  # <-- rolling latest at data root
 
     if pd is not None and isinstance(df_or_rows, pd.DataFrame):
         df_or_rows.to_csv(ts_csv, index=False)
         df_or_rows.to_csv(latest_csv, index=False)
     else:
-        # Fallback: plain csv module
-        rows = df_or_rows
-        if not rows:
-            # write empty with a minimal header
-            with open(ts_csv, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["ts_utc", "vessel_name", "imo", "status", "yard", "source"])
-            latest_csv.write_text(ts_csv.read_text(encoding="utf-8"), encoding="utf-8")
-            return ts_csv, latest_csv
-        # Write with inferred headers
-        headers = sorted(rows[0].keys())
+        rows = df_or_rows or []
+        if rows:
+            headers = sorted(rows[0].keys())
+        else:
+            headers = ["scraped_at_utc","name","mmsi","ship_type","status","last_port","distance_nm_to_berbera","eta_to_berbera_utc","speed_kn","source"]
         with open(ts_csv, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=headers)
             w.writeheader()
-            w.writerows(rows)
-        # Copy to latest
+            if rows:
+                w.writerows(rows)
         latest_csv.write_text(ts_csv.read_text(encoding="utf-8"), encoding="utf-8")
 
     print(f"📝 Wrote {ts_csv}")
     print(f"📝 Wrote {latest_csv}")
     return ts_csv, latest_csv
 
-def maybe_upload_s3(paths: list[Path], bucket: str | None) -> None:
+def s3_upload(local_file: Path, bucket: str, key: str) -> None:
+    import boto3
+    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION") or None)
+    s3.upload_file(str(local_file), bucket, key)
+    print(f"✅ Uploaded: s3://{bucket}/{key}")
+
+def maybe_upload_s3(ts_csv: Path, latest_csv: Path) -> None:
+    bucket = (os.getenv("S3_BUCKET") or "").strip()
     if not bucket:
         print("ℹ️ S3_BUCKET not set; skipping S3 upload.")
         return
-    for p in paths:
-        key = f"vf_snapshots/{p.name}"
-        _try_s3_upload(p, bucket, key)
+    prefix = (os.getenv("S3_PREFIX") or "berbera").strip().strip("/")
+    # history path with folders by time
+    ts = ts_csv.stem.split("_")[-1]  # e.g., 20251010T153000Z
+    history_folder = dt.datetime.utcnow().strftime("%Y/%m/%d/%H%M")
+    hist_key   = f"{prefix}/history/csv/{history_folder}/vf_snapshot_{ts}.csv"
+    latest_key = f"{prefix}/latest/vf_snapshot.csv"
+
+    s3_upload(ts_csv, bucket, hist_key)
+    s3_upload(latest_csv, bucket, latest_key)
 
 def main():
-    # Inputs
-    database_url = os.getenv("DATABASE_URL", "")
-    s3_bucket = os.getenv("S3_BUCKET", "")
-
-    if database_url:
-        print("🔗 DATABASE_URL is set (hidden).")
-    else:
-        print("ℹ️ DATABASE_URL not set or not required.")
-
-    # Scrape
+    print("🚀 Starting VesselFinder scrape…")
     t0 = time.time()
-    print("🚀 Starting VesselFinder scrape...")
+
     data = scrape_vesselfinder()
-    df_or_rows = to_dataframe(data)
-    elapsed = time.time() - t0
-    print(f"✅ Scrape complete in {elapsed:.2f}s. Rows: {len(data) if hasattr(data, '__len__') else 'n/a'}")
+    df = to_dataframe(data)
+    print(f"✅ Scrape done in {time.time()-t0:.2f}s; rows={len(df) if hasattr(df,'__len__') else 'n/a'}")
 
-    # Write outputs
     out_dir = Path("data") / "vf_snapshots"
-    ts_csv, latest_csv = write_outputs(df_or_rows, out_dir)
-
-    # Optional S3 upload
-    maybe_upload_s3([ts_csv, latest_csv], s3_bucket)
+    ts_csv, latest_csv = write_outputs(df, out_dir)
+    maybe_upload_s3(ts_csv, latest_csv)
 
 if __name__ == "__main__":
     main()
