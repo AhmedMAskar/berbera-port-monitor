@@ -1,88 +1,134 @@
 # scripts/vf_scrape.py
 """
-VesselFinder scraper runner (schedule controlled by GitHub Actions).
+Pull latest VesselFinder snapshot from Postgres and publish to S3.
 
-Outputs:
-- data/vf_snapshot.csv                           (rolling latest)
-- data/vf_snapshots/vf_snapshot_<TS>.csv         (history)
-Uploads to S3 (if S3_BUCKET set):
+Outputs locally:
+- data/vf_snapshot.csv
+- data/vf_snapshots/vf_snapshot_<TS>.csv
+
+Uploads to S3 (if S3_BUCKET set via env/secrets):
 - s3://<bucket>/<prefix>/latest/vf_snapshot.csv
 - s3://<bucket>/<prefix>/history/csv/YYYY/MM/DD/HHmm/vf_snapshot_<TS>.csv
 
-Env:
-- S3_BUCKET  (required for S3 upload)
-- S3_PREFIX  (optional; default: "berbera")
-- AWS_REGION (optional; boto3 will still work if omitted)
+Env needed in the GitHub Action step:
+- DATABASE_URL     (Postgres connection string)
+- S3_BUCKET        (your bucket, e.g. berbera-port-monitor)
+- S3_PREFIX        (optional; default 'berbera')
+- AWS_REGION       (e.g. us-east-1)
 """
 
 import os
-import csv
+import io
 import time
+import zlib
 import datetime as dt
 from pathlib import Path
 
-try:
-    import pandas as pd
-except Exception:
-    pd = None
+import pandas as pd
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # ------------------------------
-# Demo stub: replace with real scrape
+# Config helpers
 # ------------------------------
-def scrape_vesselfinder():
-    """
-    TODO: Replace this stub with your real scraping logic.
-    Must return a list[dict] or pandas.DataFrame with consistent columns.
-    """
-    now = dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
-    rows = [
-        {
-            "scraped_at_utc": now,
-            "name": "Demo Vessel",
-            "mmsi": "123456789",
-            "ship_type": "General Cargo",
-            "status": "in_port",  # or incoming/outgoing/expected
-            "last_port": "Aden",
-            "distance_nm_to_berbera": 0.3,
-            "eta_to_berbera_utc": None,
-            "speed_kn": 0.0,
-            "source": "VesselFinder",
-        }
-    ]
-    return rows
+def get_env(name: str, default: str = "") -> str:
+    return (os.getenv(name) or "").strip()
+
+DB_URL     = get_env("DATABASE_URL")
+S3_BUCKET  = get_env("S3_BUCKET")
+S3_PREFIX  = (get_env("S3_PREFIX") or "berbera").strip().strip("/")
+AWS_REGION = get_env("AWS_REGION") or None
 
 # ------------------------------
-# Helpers
+# Data source: Postgres
 # ------------------------------
-def _ensure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+SQL_LATEST = """
+WITH max_cap AS (SELECT MAX(captured_at) AS ts FROM vesselfinder_portcalls)
+SELECT
+  vessel_name,
+  -- optional columns below may or may not exist in your table
+  NULL::bigint AS mmsi,
+  status,
+  destination,
+  eta_utc,
+  captured_at
+FROM vesselfinder_portcalls, max_cap
+WHERE captured_at = max_cap.ts
+ORDER BY status, COALESCE(eta_utc, captured_at), vessel_name;
+"""
 
-def to_dataframe(data):
-    if pd is not None:
-        return pd.DataFrame(data)
-    return data
+STATUS_MAP = {
+    "expected":   "expected",
+    "arrivals":   "incoming",
+    "departures": "outgoing",
+    "in_port":    "in_port",
+}
 
-def write_outputs(df_or_rows, out_dir: Path) -> tuple[Path, Path]:
-    _ensure_dir(out_dir)
-    ts = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    ts_csv = out_dir / f"vf_snapshot_{ts}.csv"
-    latest_csv = Path("data") / "vf_snapshot.csv"  # <-- rolling latest at data root
+def synth_id(name: str) -> int:
+    """Stable integer from vessel name when MMSI is unavailable."""
+    if not name:
+        return 0
+    return abs(zlib.crc32(name.encode("utf-8")))
 
-    if pd is not None and isinstance(df_or_rows, pd.DataFrame):
-        df_or_rows.to_csv(ts_csv, index=False)
-        df_or_rows.to_csv(latest_csv, index=False)
-    else:
-        rows = df_or_rows or []
-        if rows:
-            headers = sorted(rows[0].keys())
-        else:
-            headers = ["scraped_at_utc","name","mmsi","ship_type","status","last_port","distance_nm_to_berbera","eta_to_berbera_utc","speed_kn","source"]
-        with open(ts_csv, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=headers)
-            w.writeheader()
-            if rows:
-                w.writerows(rows)
-        latest_csv.write_text(ts_csv.read_text(encoding="utf-8"), encoding="utf-8")
+def fetch_latest_df() -> pd.DataFrame:
+    if not DB_URL:
+        raise RuntimeError("DATABASE_URL is not set. Provide it in the GitHub Action env.")
+    with psycopg2.connect(DB_URL) as conn:
+        df = pd.read_sql(SQL_LATEST, conn)
+    if df.empty:
+        return df
+
+    # Normalize schema expected by the app
+    df = df.rename(columns={
+        "vessel_name": "name",
+        "eta_utc": "eta_to_berbera_utc",
+    })
+
+    # MMSI: if null, synthesize stable ID from vessel name
+    if "mmsi" not in df.columns or df["mmsi"].isna().all():
+        df["mmsi"] = df["name"].fillna("").map(synth_id)
+
+    # Status mapping
+    df["status"] = df["status"].astype(str).str.strip().str.lower().map(STATUS_MAP).fillna("unknown")
+
+    # Ship type (unknown for now — can be enriched later)
+    df["ship_type"] = "Unknown"
+
+    # Add required columns (distance/last_port optional; leave blank for now)
+    if "destination" in df.columns and "last_port" not in df.columns:
+        df["last_port"] = df["destination"]
+    if "distance_nm_to_berbera" not in df.columns:
+        df["distance_nm_to_berbera"] = None
+    if "speed_kn" not in df.columns:
+        df["speed_kn"] = None
+
+    # Timestamp fields
+    df["scraped_at_utc"] = pd.to_datetime(df["captured_at"], utc=True, errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if "eta_to_berbera_utc" in df.columns:
+        df["eta_to_berbera_utc"] = pd.to_datetime(df["eta_to_berbera_utc"], utc=True, errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # Order & select columns for the CSV
+    cols = ["mmsi","name","ship_type","status","last_port","distance_nm_to_berbera",
+            "eta_to_berbera_utc","speed_kn","scraped_at_utc","captured_at"]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = None
+    return df[cols]
+
+
+# ------------------------------
+# Write locally + upload to S3
+# ------------------------------
+def write_outputs(df: pd.DataFrame) -> tuple[Path, Path]:
+    out_dir = Path("data") / "vf_snapshots"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    ts_file = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    ts_csv = out_dir / f"vf_snapshot_{ts_file}.csv"
+    latest_csv = Path("data") / "vf_snapshot.csv"
+
+    df.to_csv(ts_csv, index=False)
+    df.to_csv(latest_csv, index=False)
 
     print(f"📝 Wrote {ts_csv}")
     print(f"📝 Wrote {latest_csv}")
@@ -90,36 +136,33 @@ def write_outputs(df_or_rows, out_dir: Path) -> tuple[Path, Path]:
 
 def s3_upload(local_file: Path, bucket: str, key: str) -> None:
     import boto3
-    s3 = boto3.client("s3", region_name=os.getenv("AWS_REGION") or None)
+    s3 = boto3.client("s3", region_name=AWS_REGION)
     s3.upload_file(str(local_file), bucket, key)
     print(f"✅ Uploaded: s3://{bucket}/{key}")
 
-def maybe_upload_s3(ts_csv: Path, latest_csv: Path) -> None:
-    bucket = (os.getenv("S3_BUCKET") or "").strip()
-    if not bucket:
+def upload_to_s3(ts_csv: Path, latest_csv: Path) -> None:
+    if not S3_BUCKET:
         print("ℹ️ S3_BUCKET not set; skipping S3 upload.")
         return
-    prefix = (os.getenv("S3_PREFIX") or "berbera").strip().strip("/")
-    # history path with folders by time
-    ts = ts_csv.stem.split("_")[-1]  # e.g., 20251010T153000Z
     history_folder = dt.datetime.utcnow().strftime("%Y/%m/%d/%H%M")
-    hist_key   = f"{prefix}/history/csv/{history_folder}/vf_snapshot_{ts}.csv"
-    latest_key = f"{prefix}/latest/vf_snapshot.csv"
+    hist_key   = f"{S3_PREFIX}/history/csv/{history_folder}/{ts_csv.name}"
+    latest_key = f"{S3_PREFIX}/latest/vf_snapshot.csv"
+    s3_upload(ts_csv, S3_BUCKET, hist_key)
+    s3_upload(latest_csv, S3_BUCKET, latest_key)
 
-    s3_upload(ts_csv, bucket, hist_key)
-    s3_upload(latest_csv, bucket, latest_key)
-
+# ------------------------------
+# Main
+# ------------------------------
 def main():
-    print("🚀 Starting VesselFinder scrape…")
+    print("🚀 Fetching latest VF snapshot from Postgres…")
     t0 = time.time()
+    df = fetch_latest_df()
+    print(f"✅ Retrieved {len(df)} rows in {time.time()-t0:.2f}s")
 
-    data = scrape_vesselfinder()
-    df = to_dataframe(data)
-    print(f"✅ Scrape done in {time.time()-t0:.2f}s; rows={len(df) if hasattr(df,'__len__') else 'n/a'}")
-
-    out_dir = Path("data") / "vf_snapshots"
-    ts_csv, latest_csv = write_outputs(df, out_dir)
-    maybe_upload_s3(ts_csv, latest_csv)
+    if df.empty:
+        print("⚠️ No rows found in vesselfinder_portcalls for the latest captured_at.")
+    ts_csv, latest_csv = write_outputs(df)
+    upload_to_s3(ts_csv, latest_csv)
 
 if __name__ == "__main__":
     main()
