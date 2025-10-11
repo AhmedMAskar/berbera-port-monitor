@@ -2,7 +2,7 @@ name: Scrape VesselFinder (4x daily)
 
 on:
   schedule:
-    - cron: "13 0,6,12,18 * * *"
+    - cron: "13 0,6,12,18 * * *"   # 00:13, 06:13, 12:13, 18:13 UTC
   workflow_dispatch: {}
 
 permissions:
@@ -26,6 +26,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r scripts/requirements.txt
 
+      # AWS creds so the script can upload to S3
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -33,14 +34,16 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      - name: Run VesselFinder scraper (writes latest+history locally & uploads to S3)
+      # 👇 Pass DATABASE_URL + S3 info to your Python script
+      - name: Run VesselFinder scraper (DB → CSV → S3)
         env:
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-          S3_PREFIX: ${{ secrets.S3_PREFIX }}   # e.g., "berbera"  (optional)
-          AWS_REGION: ${{ secrets.AWS_REGION }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          S3_BUCKET:    ${{ secrets.S3_BUCKET }}
+          S3_PREFIX:    ${{ secrets.S3_PREFIX }}   # e.g., "berbera"
+          AWS_REGION:   ${{ secrets.AWS_REGION }}
         run: python scripts/vf_scrape.py
 
-      # optional artifact for quick debugging
+      # Optional: keep artifacts for debugging/download
       - name: Upload CSVs as workflow artifact
         uses: actions/upload-artifact@v4
         with:
