@@ -1,16 +1,27 @@
 name: Scrape VesselFinder (daily)
+
 on:
   schedule:
-    - cron: "13 8 * * *"   # daily at 08:13 UTC
+    - cron: "0 6 * * *"   # runs daily at 06:00 UTC
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     permissions:
+      id-token: write
       contents: read
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::<AWS_ACCOUNT_ID>:role/<YOUR_ROLE_NAME>
+          aws-region: us-east-1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -20,17 +31,47 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r scripts/requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run scraper
+      - name: Confirm AWS connection (debug)
+        run: aws sts get-caller-identity
+
+      - name: Run scrape #1
         env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          S3_BUCKET:    ${{ secrets.S3_BUCKET }}
+          S3_BUCKET: your-bucket-name
+          S3_PREFIX: berbera-port-monitor/run1/
         run: |
+          echo "🟢 Running scrape 1..."
           python scripts/vf_scrape.py
 
-      - name: Upload CSVs as workflow artifact
+      - name: Run scrape #2
+        env:
+          S3_BUCKET: your-bucket-name
+          S3_PREFIX: berbera-port-monitor/run2/
+        run: |
+          echo "🟢 Running scrape 2..."
+          python scripts/vf_scrape.py
+
+      - name: Run scrape #3
+        env:
+          S3_BUCKET: your-bucket-name
+          S3_PREFIX: berbera-port-monitor/run3/
+        run: |
+          echo "🟢 Running scrape 3..."
+          python scripts/vf_scrape.py
+
+      - name: Run scrape #4
+        env:
+          S3_BUCKET: your-bucket-name
+          S3_PREFIX: berbera-port-monitor/run4/
+        run: |
+          echo "🟢 Running scrape 4..."
+          python scripts/vf_scrape.py
+
+      # Optional: upload any output files created locally (for debugging)
+      - name: Upload scraper outputs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vf-snapshots
-          path: data/vf_snapshots/**
+          name: vf-scrape-outputs
+          path: output/**
