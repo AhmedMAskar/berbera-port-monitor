@@ -1,77 +1,74 @@
-name: Scrape VesselFinder (daily)
+name: Scrape VesselFinder (4x daily)
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # runs daily at 06:00 UTC
+    - cron: '13 0,6,12,18 * * *'
   workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
-    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::<AWS_ACCOUNT_ID>:role/<YOUR_ROLE_NAME>
-          aws-region: us-east-1
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install dependencies (scraper only)
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r scripts/requirements.txt
 
-      - name: Confirm AWS connection (debug)
-        run: aws sts get-caller-identity
-
-      - name: Run scrape #1
+      - name: Preflight: DB snapshot counts
         env:
-          S3_BUCKET: your-bucket-name
-          S3_PREFIX: berbera-port-monitor/run1/
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        shell: bash
         run: |
-          echo "🟢 Running scrape 1..."
-          python scripts/vf_scrape.py
+          python - <<'PY'
+          import os, pandas as pd, psycopg2
+          url = os.environ["DATABASE_URL"]
+          with psycopg2.connect(url) as conn:
+              ts = pd.read_sql("SELECT MAX(captured_at) AS ts FROM vesselfinder_portcalls;", conn)["ts"].iat[0]
+              print("Latest captured_at:", ts)
+              if not ts:
+                  raise SystemExit("❌ Table has no captured_at yet — nothing to upload.")
+              df = pd.read_sql("""
+              WITH max_cap AS (SELECT MAX(captured_at) AS ts FROM vesselfinder_portcalls)
+              SELECT status, COUNT(*) AS rows
+              FROM vesselfinder_portcalls, max_cap
+              WHERE captured_at = max_cap.ts
+              GROUP BY status ORDER BY status;
+              """, conn)
+              print("\n=== Rows by status at latest ===")
+              print(df.to_string(index=False))
+              if int(df["rows"].sum()) == 0:
+                  raise SystemExit("❌ Latest snapshot has zero rows — aborting.")
+          PY
 
-      - name: Run scrape #2
+      - name: Run VesselFinder scraper (DB -> CSV -> S3)
         env:
-          S3_BUCKET: your-bucket-name
-          S3_PREFIX: berbera-port-monitor/run2/
-        run: |
-          echo "🟢 Running scrape 2..."
-          python scripts/vf_scrape.py
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          S3_BUCKET: ${{ secrets.S3_BUCKET }}
+          S3_PREFIX: ${{ secrets.S3_PREFIX }}
+        run: python scripts/vf_scrape.py
 
-      - name: Run scrape #3
+      - name: Inspect S3 upload (head)
         env:
-          S3_BUCKET: your-bucket-name
-          S3_PREFIX: berbera-port-monitor/run3/
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          BUCKET: ${{ secrets.S3_BUCKET }}
+          PREFIX: ${{ secrets.S3_PREFIX }}
         run: |
-          echo "🟢 Running scrape 3..."
-          python scripts/vf_scrape.py
-
-      - name: Run scrape #4
-        env:
-          S3_BUCKET: your-bucket-name
-          S3_PREFIX: berbera-port-monitor/run4/
-        run: |
-          echo "🟢 Running scrape 4..."
-          python scripts/vf_scrape.py
-
-      # Optional: upload any output files created locally (for debugging)
-      - name: Upload scraper outputs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: vf-scrape-outputs
-          path: output/**
+          aws s3 ls "s3://${BUCKET}/${PREFIX}/latest/vf_snapshot.csv"
+          aws s3 cp "s3://${BUCKET}/${PREFIX}/latest/vf_snapshot.csv" ./latest_check.csv --only-show-errors
+          head -n 6 latest_check.csv || true
