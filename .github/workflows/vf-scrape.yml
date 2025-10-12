@@ -1,74 +1,27 @@
-name: Scrape VesselFinder (4x daily)
-
-on:
-  schedule:
-    - cron: '13 0,6,12,18 * * *'
-  workflow_dispatch:
-
-jobs:
-  scrape:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies (scraper only)
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r scripts/requirements.txt
-
-      - name: Preflight: DB snapshot counts
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os, pandas as pd, psycopg2
-          url = os.environ["DATABASE_URL"]
-          with psycopg2.connect(url) as conn:
-              ts = pd.read_sql("SELECT MAX(captured_at) AS ts FROM vesselfinder_portcalls;", conn)["ts"].iat[0]
-              print("Latest captured_at:", ts)
-              if not ts:
-                  raise SystemExit("❌ Table has no captured_at yet — nothing to upload.")
-              df = pd.read_sql("""
-              WITH max_cap AS (SELECT MAX(captured_at) AS ts FROM vesselfinder_portcalls)
-              SELECT status, COUNT(*) AS rows
-              FROM vesselfinder_portcalls, max_cap
-              WHERE captured_at = max_cap.ts
-              GROUP BY status ORDER BY status;
-              """, conn)
-              print("\n=== Rows by status at latest ===")
-              print(df.to_string(index=False))
-              if int(df["rows"].sum()) == 0:
-                  raise SystemExit("❌ Latest snapshot has zero rows — aborting.")
-          PY
-
-      - name: Run VesselFinder scraper (DB -> CSV -> S3)
-        env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          S3_BUCKET: ${{ secrets.S3_BUCKET }}
-          S3_PREFIX: ${{ secrets.S3_PREFIX }}
-        run: python scripts/vf_scrape.py
-
-      - name: Inspect S3 upload (head)
-        env:
-          AWS_REGION: ${{ secrets.AWS_REGION }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          BUCKET: ${{ secrets.S3_BUCKET }}
-          PREFIX: ${{ secrets.S3_PREFIX }}
-        run: |
-          aws s3 ls "s3://${BUCKET}/${PREFIX}/latest/vf_snapshot.csv"
-          aws s3 cp "s3://${BUCKET}/${PREFIX}/latest/vf_snapshot.csv" ./latest_check.csv --only-show-errors
-          head -n 6 latest_check.csv || true
+# --- Preflight: prove DB has rows at the latest captured_at ---
+- name: Preflight: DB snapshot counts
+  env:
+    DATABASE_URL: ${{ secrets.DATABASE_URL }}
+  run: |
+    python - <<'PY'
+    import os, pandas as pd, psycopg2
+    url = os.environ["DATABASE_URL"]
+    with psycopg2.connect(url) as conn:
+        # Latest timestamp
+        ts = pd.read_sql("SELECT MAX(captured_at) AS ts FROM vesselfinder_portcalls;", conn)["ts"].iat[0]
+        print("Latest captured_at:", ts)
+        if not ts:
+            raise SystemExit("❌ Table has no captured_at yet — nothing to upload.")
+        # Counts by status
+        df = pd.read_sql("""
+          WITH max_cap AS (SELECT MAX(captured_at) AS ts FROM vesselfinder_portcalls)
+          SELECT status, COUNT(*) AS rows
+          FROM vesselfinder_portcalls, max_cap
+          WHERE captured_at = max_cap.ts
+          GROUP BY status ORDER BY status;
+        """, conn)
+        print("\n=== Rows by status at latest ===")
+        print(df.to_string(index=False))
+        if df["rows"].sum() == 0:
+            raise SystemExit("❌ Latest snapshot has zero rows — aborting to avoid uploading an empty 'latest'.")
+    PY
