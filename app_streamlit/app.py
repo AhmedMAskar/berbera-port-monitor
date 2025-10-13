@@ -203,10 +203,39 @@ df_all = pd.concat([vf_hist, vf_latest], ignore_index=True) if not vf_latest.emp
 df_all = unify_schema(df_all).drop_duplicates(subset=["mmsi","scraped_at_utc"], keep="last")
 df_all = add_time_bins(df_all)
 
-# Debug expander
+# # Debug expander replaced with this one 
+# with st.expander("🔧 Debug – source & counts"):
+#     st.write("Bucket/prefix:", S3_BUCKET, "/", S3_PREFIX)
+#     st.write("Latest ETag:", etag)
+#     st.write("Rows in latest:", 0 if vf_latest is None else len(vf_latest))
+#     if not vf_latest.empty:
+#         st.write(vf_latest.head(5))
+#     if not df_all.empty:
+#         st.write("Statuses:", df_all["status"].value_counts(dropna=False))
+# Debug expander replaced with this one 
 with st.expander("🔧 Debug – source & counts"):
-    st.write("Bucket/prefix:", S3_BUCKET, "/", S3_PREFIX)
-    st.write("Latest ETag:", etag)
+    # 🧪 S3 health check (exact object & metadata)
+    try:
+        cli = s3_client()
+        head = cli.head_object(Bucket=S3_BUCKET, Key=latest_key)
+        st.write("🧪 S3 health check")
+        st.write("Bucket:", S3_BUCKET)
+        st.write("Key:", latest_key)
+        st.write("S3 Last-Modified:", head["LastModified"])
+        st.write("S3 ETag:", head["ETag"])
+        st.write("S3 ContentLength (bytes):", head["ContentLength"])
+    except Exception as e:
+        st.error(f"S3 HEAD failed: {e}")
+
+    # 🔐 Secrets sanity (quick visibility)
+    st.write("S3_BUCKET:", S3_BUCKET)
+    st.write("S3_PREFIX:", S3_PREFIX)
+    st.write("AWS_REGION:", AWS_REGION)
+    st.write("Have Access Key?:", bool(AWS_ACCESS_KEY_ID))
+    st.write("Have Secret Key?:", bool(AWS_SECRET_ACCESS_KEY))
+
+    # existing debug
+    st.write("Latest ETag (from head fn):", etag)
     st.write("Rows in latest:", 0 if vf_latest is None else len(vf_latest))
     if not vf_latest.empty:
         st.write(vf_latest.head(5))
