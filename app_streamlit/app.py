@@ -6,12 +6,13 @@
 # - Tables for In-Port / Incoming / Outgoing / Expected
 # - Charts: Daily/Weekly/Monthly/Yearly, stacked by ship type
 # - Capacity stat (in-port vs capacity)
+# - Built-in S3 health + cache-bust diagnostics
 # ------------------------------------------------------------
 
 import os
 import io
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
@@ -30,7 +31,7 @@ S3_PREFIX   = (st.secrets.get("S3_PREFIX")   or os.getenv("S3_PREFIX")   or "ber
 AWS_REGION  = (st.secrets.get("AWS_REGION")  or os.getenv("AWS_REGION")  or None)
 CAPACITY    = int(st.secrets.get("IN_PORT_CAPACITY", os.getenv("IN_PORT_CAPACITY", 10)))
 
-# Read-only AWS creds (Option A)
+# Read-only AWS creds (Streamlit)
 AWS_ACCESS_KEY_ID     = (st.secrets.get("AWS_ACCESS_KEY_ID")     or os.getenv("AWS_ACCESS_KEY_ID"))
 AWS_SECRET_ACCESS_KEY = (st.secrets.get("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY"))
 
@@ -58,15 +59,17 @@ def _read_csv_from_s3(bucket: str, key: str) -> pd.DataFrame:
     obj = s3.get_object(Bucket=bucket, Key=key)
     return pd.read_csv(io.BytesIO(obj["Body"].read()))
 
-@st.cache_data(ttl=0)
-def _s3_head_etag(bucket: str, key: str) -> str:
-    """ETag changes when 'latest' is overwritten; use as cache-buster."""
-    s3 = s3_client()
-    resp = s3.head_object(Bucket=bucket, Key=key)
-    return resp.get("ETag", "").strip('"')
+@st.cache_data(ttl=60)
+def _s3_head_sig(bucket: str, key: str) -> Tuple[str, str]:
+    """Return (etag, last_modified_iso) so any change busts cache."""
+    resp = s3_client().head_object(Bucket=bucket, Key=key)
+    etag = resp.get("ETag", "").strip('"')
+    lm = resp.get("LastModified")
+    lm_iso = lm.isoformat() if lm is not None else ""
+    return etag, lm_iso
 
 @st.cache_data(ttl=0)
-def load_vf_latest_from_s3(cache_bust: str) -> pd.DataFrame:
+def load_vf_latest_from_s3(cache_bust_sig: Tuple[str, str]) -> pd.DataFrame:
     key = f"{S3_PREFIX}/latest/vf_snapshot.csv"
     try:
         return _read_csv_from_s3(S3_BUCKET, key)
@@ -89,7 +92,7 @@ def list_history_keys(limit: int = 500) -> List[str]:
     return keys[-limit:]
 
 @st.cache_data(ttl=0)
-def load_vf_history_from_s3(cache_bust: str, limit_keys: int = 500) -> pd.DataFrame:
+def load_vf_history_from_s3(cache_bust_sig: Tuple[str, str], limit_keys: int = 500) -> pd.DataFrame:
     keys = list_history_keys(limit=limit_keys)
     if not keys:
         return pd.DataFrame()
@@ -194,14 +197,12 @@ with top:
             st.rerun()
 
 latest_key = f"{S3_PREFIX}/latest/vf_snapshot.csv"
-etag = _s3_head_etag(S3_BUCKET, latest_key)  # cache-buster
+sig = _s3_head_sig(S3_BUCKET, latest_key)  # (etag, last_modified_iso)
 
-vf_latest = load_vf_latest_from_s3(etag)
-vf_hist   = load_vf_history_from_s3(etag, limit_keys=600)
+vf_latest = load_vf_latest_from_s3(sig)
+vf_hist   = load_vf_history_from_s3(sig, limit_keys=600)
 
-#####
-#### added
-# 📄 Show what we actually loaded from S3 (helps verify freshness)
+# 📄 Show what we actually loaded (helps verify freshness)
 with st.expander("📄 What did we load from S3?"):
     st.write("Rows in vf_latest:", 0 if vf_latest is None else len(vf_latest))
     if not vf_latest.empty and "scraped_at_utc" in vf_latest.columns:
@@ -214,16 +215,7 @@ df_all = pd.concat([vf_hist, vf_latest], ignore_index=True) if not vf_latest.emp
 df_all = unify_schema(df_all).drop_duplicates(subset=["mmsi","scraped_at_utc"], keep="last")
 df_all = add_time_bins(df_all)
 
-# # Debug expander replaced with this one 
-# with st.expander("🔧 Debug – source & counts"):
-#     st.write("Bucket/prefix:", S3_BUCKET, "/", S3_PREFIX)
-#     st.write("Latest ETag:", etag)
-#     st.write("Rows in latest:", 0 if vf_latest is None else len(vf_latest))
-#     if not vf_latest.empty:
-#         st.write(vf_latest.head(5))
-#     if not df_all.empty:
-#         st.write("Statuses:", df_all["status"].value_counts(dropna=False))
-# Debug expander replaced with this one 
+# Debug expander
 with st.expander("🔧 Debug – source & counts"):
     # 🧪 S3 health check (exact object & metadata)
     try:
@@ -245,8 +237,8 @@ with st.expander("🔧 Debug – source & counts"):
     st.write("Have Access Key?:", bool(AWS_ACCESS_KEY_ID))
     st.write("Have Secret Key?:", bool(AWS_SECRET_ACCESS_KEY))
 
-    # existing debug
-    st.write("Latest ETag (from head fn):", etag)
+    # Existing debug
+    st.write("Latest signature (etag, last_modified):", sig)
     st.write("Rows in latest:", 0 if vf_latest is None else len(vf_latest))
     if not vf_latest.empty:
         st.write(vf_latest.head(5))
@@ -280,7 +272,6 @@ else:
     k4.metric("Expected (VF)", 0)
     k5.metric("Incoming (VF)", 0)
 
-# ✅ Fixed: use plain if/else, not inline conditional
 if cap["at_capacity"]:
     st.warning("Port is at or above capacity.")
 else:
@@ -318,14 +309,21 @@ if fresh:
     if selected_types:
         latest_df = latest_df[latest_df["ship_type"].isin(selected_types)]
 
-cols = ["name","mmsi","ship_type","status","last_port","distance_nm_to_berbera","eta_to_berbera_utc","speed_kn","scraped_at_utc","source"]
+cols = [
+    "name","mmsi","ship_type","status","last_port",
+    "distance_nm_to_berbera","eta_to_berbera_utc","speed_kn",
+    "scraped_at_utc","source"
+]
 if latest_df.empty:
     st.info("No rows for the current filter yet.")
 else:
     st.dataframe(latest_df[cols], use_container_width=True, hide_index=True)
-    st.download_button("⬇️ Download CSV",
-                       data=latest_df[cols].to_csv(index=False).encode("utf-8"),
-                       file_name=f"{status}_latest.csv", mime="text/csv")
+    st.download_button(
+        "⬇️ Download CSV",
+        data=latest_df[cols].to_csv(index=False).encode("utf-8"),
+        file_name=f"{status}_latest.csv",
+        mime="text/csv"
+    )
 
 st.markdown("---")
 
@@ -334,7 +332,13 @@ grouped = group_counts(df_all, status=status, freq=freq, ship_types=selected_typ
 if grouped.empty:
     st.info("No time series yet for the selected filters.")
 else:
-    fig = px.area(grouped, x="ts", y="count", color="ship_type",
-                  labels={"ts":"Time","count":"Distinct vessels"})
-    fig.update_layout(legend_title_text="Ship type", hovermode="x unified", margin=dict(l=0,r=0,t=10,b=0))
+    fig = px.area(
+        grouped, x="ts", y="count", color="ship_type",
+        labels={"ts":"Time","count":"Distinct vessels"}
+    )
+    fig.update_layout(
+        legend_title_text="Ship type",
+        hovermode="x unified",
+        margin=dict(l=0, r=0, t=10, b=0)
+    )
     st.plotly_chart(fig, use_container_width=True)
