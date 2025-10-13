@@ -199,6 +199,17 @@ etag = _s3_head_etag(S3_BUCKET, latest_key)  # cache-buster
 vf_latest = load_vf_latest_from_s3(etag)
 vf_hist   = load_vf_history_from_s3(etag, limit_keys=600)
 
+#####
+#### added
+# 📄 Show what we actually loaded from S3 (helps verify freshness)
+with st.expander("📄 What did we load from S3?"):
+    st.write("Rows in vf_latest:", 0 if vf_latest is None else len(vf_latest))
+    if not vf_latest.empty and "scraped_at_utc" in vf_latest.columns:
+        mmin = pd.to_datetime(vf_latest["scraped_at_utc"], errors="coerce").min()
+        mmax = pd.to_datetime(vf_latest["scraped_at_utc"], errors="coerce").max()
+        st.write("scraped_at_utc range:", str(mmin), "→", str(mmax))
+        st.dataframe(vf_latest.head(10), use_container_width=True)
+
 df_all = pd.concat([vf_hist, vf_latest], ignore_index=True) if not vf_latest.empty else vf_hist
 df_all = unify_schema(df_all).drop_duplicates(subset=["mmsi","scraped_at_utc"], keep="last")
 df_all = add_time_bins(df_all)
