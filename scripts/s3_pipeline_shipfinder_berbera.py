@@ -1,21 +1,26 @@
 # scripts/s3_pipeline_shipfinder_berbera.py
 """
-VesselFinder Berbera -> S3 (robust parsing)
+VesselFinder Berbera -> S3 (robust parsing, S3-only, no database)
 - Headless Playwright (real UA, webdriver masked), no 'networkidle' wait.
 - Scrolls & clicks generic cookie banners.
 - Scrapes tables on main page + iframes.
 - Parses tables via BeautifulSoup (robust to odd headers).
 - Heuristics for column names; falls back to first column as vessel name.
-- Saves artifacts (page.html, screenshot.png, each table as CSV) for debugging.
+- Infers ship_type from name when embedded (e.g., 'CECELLIAGeneral Cargo Ship').
+- Saves artifacts (page.html, screenshot.png, table_*.csv) for debugging.
 - Uploads to:
     s3://<S3_BUCKET>/<S3_PREFIX>/latest/vf_snapshot.csv
     s3://<S3_BUCKET>/<S3_PREFIX>/history/csv/YYYY/MM/DD/HHmm/vf_snapshot_<UTC>.csv
+
+Env (set in GitHub Actions step):
+  S3_BUCKET   (required)  e.g., berbera-port-monitor
+  S3_PREFIX   (default 'berbera')
+  AWS_REGION  (e.g., us-east-1)
+  VF_URL      (default https://www.vesselfinder.com/ports/SOBBO001)
 """
 
 import os
-import io
 import zlib
-import csv
 import time
 import datetime as dt
 from typing import List, Tuple, Optional, Dict
@@ -24,6 +29,7 @@ import pandas as pd
 import boto3
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
 
 # -------------------------
 # Config / Helpers
@@ -90,6 +96,7 @@ def write_outputs(df: pd.DataFrame) -> Tuple[str, str]:
     put_csv(S3_BUCKET, hist_key, csv_bytes)
     return latest_key, hist_key
 
+
 # -------------------------
 # Scrape utilities
 # -------------------------
@@ -129,17 +136,19 @@ def html_table_to_df(table_html: str) -> pd.DataFrame:
     table = soup.find("table")
     if table is None:
         return pd.DataFrame()
+
     # headers
     headers = []
-    header_row = table.find("thead")
-    if header_row:
-        ths = header_row.find_all("th")
+    thead = table.find("thead")
+    if thead:
+        ths = thead.find_all("th")
         headers = [th.get_text(strip=True) for th in ths]
+
     if not headers:
-        # try first row as header
         first_tr = table.find("tr")
         if first_tr:
             headers = [td.get_text(strip=True) for td in first_tr.find_all(["th","td"])]
+
     # rows
     rows = []
     for tr in table.find_all("tr"):
@@ -147,22 +156,22 @@ def html_table_to_df(table_html: str) -> pd.DataFrame:
         if not tds:
             continue
         rows.append([td.get_text(strip=True) for td in tds])
-    # remove header row if duplicated
+
+    # drop duplicate header row
     if rows and headers and [c.lower() for c in rows[0]] == [c.lower() for c in headers]:
         rows = rows[1:]
-    # ensure rectangular
+
     width = max((len(headers), *(len(r) for r in rows)), default=0)
     if not headers or len(headers) < width:
         headers = headers + [f"col_{i}" for i in range(len(headers), width)]
     norm_rows = [r + [""]*(width - len(r)) for r in rows]
+
     df = pd.DataFrame(norm_rows, columns=headers)
-    # drop empty rows
     df = df.replace("", pd.NA).dropna(how="all")
     return df
 
 # Flexible header matching
 def pick_col(cols: List[str], patterns: List[str]) -> Optional[str]:
-    lc = [c.lower().strip() for c in cols]
     for p in patterns:
         for c in cols:
             if p in c.lower():
@@ -176,8 +185,35 @@ TO_PATTERNS    = ["to", "destination", "dest", "next port", "port of call"]
 ETA_PATTERNS   = ["eta", "arrives", "arrival", "atd/eta"]
 SPEED_PATTERNS = ["speed", "kn", "knots"]
 
+# Known type phrases often appended to the name on VF
+KNOWN_TYPE_PHRASES = [
+    "General Cargo Ship",
+    "Container Ship",
+    "Bulk Carrier",
+    "Cargo ship",
+    "Oil Products Tanker",
+    "Chemical/Oil Products Tanker",
+    "Sailing vessel",
+    "Livestock Carrier",
+    "Tug",
+    "Ro-Ro/Passenger Ship",
+    "Passenger Ship",
+]
+
+def split_name_and_type(raw: str) -> (str, Optional[str]):
+    if not raw:
+        return "", None
+    txt = str(raw).strip()
+    for phrase in sorted(KNOWN_TYPE_PHRASES, key=len, reverse=True):
+        if phrase.replace(" ", "").lower() in txt.replace(" ", "").lower():
+            lowered = txt.lower()
+            idx = lowered.rfind(phrase.lower())
+            if idx != -1:
+                name_part = txt[:idx].strip(" -–—·")
+                return (name_part.strip(), phrase)
+    return (txt, None)
+
 def coerce_eta(series: pd.Series) -> pd.Series:
-    # accept many human strings; keep best-effort UTC strings
     s = pd.to_datetime(series, errors="coerce", utc=True)
     return s.dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -186,7 +222,7 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
     if df.empty:
         return pd.DataFrame(columns=APP_COLS)
 
-    # Save raw table CSV (artifact) if path provided
+    # Optional: save raw table CSV for debugging
     if save_csv_to:
         try:
             df.to_csv(save_csv_to, index=False)
@@ -194,7 +230,7 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
             pass
 
     cols = df.columns.tolist()
-    # Identify columns
+
     name_col  = pick_col(cols, NAME_PATTERNS) or (cols[0] if cols else None)
     type_col  = pick_col(cols, TYPE_PATTERNS)
     from_col  = pick_col(cols, FROM_PATTERNS)
@@ -208,9 +244,9 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
     # Name (fallback to first column)
     out["name"] = df[name_col].astype(str).str.strip() if name_col else pd.Series([None]*len(df))
 
-    # MMSI (optional)
+    # MMSI (optional; synth later if missing)
     if mmsi_col:
-        out["mmsi"] = pd.to_numeric(df[mmsi_col].str.replace(r"[^\d]", "", regex=True), errors="coerce")
+        out["mmsi"] = pd.to_numeric(df[mmsi_col].astype(str).str.replace(r"[^\d]", "", regex=True), errors="coerce")
     else:
         out["mmsi"] = pd.NA
 
@@ -248,6 +284,18 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
     out["status"] = heading_to_status(heading_text) or "unknown"
 
     out_df = pd.DataFrame(out)
+
+    # If ship_type is Unknown but embedded in the name, split it
+    if "ship_type" in out_df.columns:
+        mask_unknown = out_df["ship_type"].isna() | (out_df["ship_type"] == "") | (out_df["ship_type"] == "Unknown")
+        if mask_unknown.any():
+            new_names, inferred_types = [], []
+            for n in out_df.loc[mask_unknown, "name"].astype(str):
+                nn, it = split_name_and_type(n)
+                new_names.append(nn)
+                inferred_types.append(it if it else "Unknown")
+            out_df.loc[mask_unknown, "name"] = new_names
+            out_df.loc[mask_unknown, "ship_type"] = inferred_types
 
     # MMSI synth if missing
     if out_df["mmsi"].isna().any():
@@ -384,6 +432,7 @@ def normalize_concat(tables: List[Tuple[str, str]], artifact_dir: str) -> pd.Dat
         df["status"] = df["status"].astype(str).str.strip().str.lower()
         df = df.dropna(subset=["name"]).drop_duplicates(subset=["mmsi","name","status"], keep="last")
     return df
+
 
 # -------------------------
 # Main
