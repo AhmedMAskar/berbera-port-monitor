@@ -1,31 +1,28 @@
 # scripts/s3_pipeline_shipfinder_berbera.py
 """
-Automated S3-only pipeline for VesselFinder Berbera page (Playwright, hardened):
-- Uses realistic UA and masks webdriver.
-- NO 'networkidle' wait (many sites never get idle).
-- Gentle waits + scroll to trigger lazy content.
-- Searches tables on main page and in iframes.
-- Saves page.html & screenshot.png artifacts for debugging.
-- Uploads CSV to:
+VesselFinder Berbera -> S3 (robust parsing)
+- Headless Playwright (real UA, webdriver masked), no 'networkidle' wait.
+- Scrolls & clicks generic cookie banners.
+- Scrapes tables on main page + iframes.
+- Parses tables via BeautifulSoup (robust to odd headers).
+- Heuristics for column names; falls back to first column as vessel name.
+- Saves artifacts (page.html, screenshot.png, each table as CSV) for debugging.
+- Uploads to:
     s3://<S3_BUCKET>/<S3_PREFIX>/latest/vf_snapshot.csv
     s3://<S3_BUCKET>/<S3_PREFIX>/history/csv/YYYY/MM/DD/HHmm/vf_snapshot_<UTC>.csv
-
-Env:
-  S3_BUCKET  (required)
-  S3_PREFIX="berbera"
-  AWS_REGION (e.g., us-east-1)
-  VF_URL="https://www.vesselfinder.com/ports/SOBBO001"
 """
 
 import os
 import io
 import zlib
+import csv
 import time
 import datetime as dt
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import pandas as pd
 import boto3
+from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # -------------------------
@@ -97,7 +94,6 @@ def write_outputs(df: pd.DataFrame) -> Tuple[str, str]:
 # Scrape utilities
 # -------------------------
 def try_click_cookies(page):
-    # attempt generic cookie banners; ignore failures
     selectors = [
         "button:has-text('Accept')",
         "button:has-text('I Agree')",
@@ -127,57 +123,144 @@ def heading_to_status(h: str) -> Optional[str]:
             return val
     return None
 
-def parse_table_html(table_html: str, heading_text: str) -> pd.DataFrame:
-    try:
-        dfs = pd.read_html(table_html, flavor="bs4")
-    except Exception:
+def html_table_to_df(table_html: str) -> pd.DataFrame:
+    """Parse a <table> HTML to DataFrame via BeautifulSoup (robust and explicit)."""
+    soup = BeautifulSoup(table_html, "html.parser")
+    table = soup.find("table")
+    if table is None:
+        return pd.DataFrame()
+    # headers
+    headers = []
+    header_row = table.find("thead")
+    if header_row:
+        ths = header_row.find_all("th")
+        headers = [th.get_text(strip=True) for th in ths]
+    if not headers:
+        # try first row as header
+        first_tr = table.find("tr")
+        if first_tr:
+            headers = [td.get_text(strip=True) for td in first_tr.find_all(["th","td"])]
+    # rows
+    rows = []
+    for tr in table.find_all("tr"):
+        tds = tr.find_all(["td","th"])
+        if not tds:
+            continue
+        rows.append([td.get_text(strip=True) for td in tds])
+    # remove header row if duplicated
+    if rows and headers and [c.lower() for c in rows[0]] == [c.lower() for c in headers]:
+        rows = rows[1:]
+    # ensure rectangular
+    width = max((len(headers), *(len(r) for r in rows)), default=0)
+    if not headers or len(headers) < width:
+        headers = headers + [f"col_{i}" for i in range(len(headers), width)]
+    norm_rows = [r + [""]*(width - len(r)) for r in rows]
+    df = pd.DataFrame(norm_rows, columns=headers)
+    # drop empty rows
+    df = df.replace("", pd.NA).dropna(how="all")
+    return df
+
+# Flexible header matching
+def pick_col(cols: List[str], patterns: List[str]) -> Optional[str]:
+    lc = [c.lower().strip() for c in cols]
+    for p in patterns:
+        for c in cols:
+            if p in c.lower():
+                return c
+    return None
+
+NAME_PATTERNS  = ["vessel", "ship name", "ship", "name"]
+TYPE_PATTERNS  = ["type", "ship type"]
+FROM_PATTERNS  = ["from", "origin", "last port", "previous", "prev port"]
+TO_PATTERNS    = ["to", "destination", "dest", "next port", "port of call"]
+ETA_PATTERNS   = ["eta", "arrives", "arrival", "atd/eta"]
+SPEED_PATTERNS = ["speed", "kn", "knots"]
+
+def coerce_eta(series: pd.Series) -> pd.Series:
+    # accept many human strings; keep best-effort UTC strings
+    s = pd.to_datetime(series, errors="coerce", utc=True)
+    return s.dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] = None) -> pd.DataFrame:
+    df = html_table_to_df(table_html)
+    if df.empty:
         return pd.DataFrame(columns=APP_COLS)
-    if not dfs:
-        return pd.DataFrame(columns=APP_COLS)
-    df = dfs[0]
-    cols = [str(c).strip().lower() for c in df.columns]
-    df.columns = cols
 
-    out = pd.DataFrame()
-    name_col = next((c for c in cols if "vessel" in c or "name" in c or "ship" in c), None)
-    out["name"] = df[name_col].astype(str).str.strip() if name_col else None
+    # Save raw table CSV (artifact) if path provided
+    if save_csv_to:
+        try:
+            df.to_csv(save_csv_to, index=False)
+        except Exception:
+            pass
 
-    mmsi_col = next((c for c in cols if "mmsi" in c), None)
-    out["mmsi"] = pd.to_numeric(df[mmsi_col], errors="coerce") if mmsi_col else None
+    cols = df.columns.tolist()
+    # Identify columns
+    name_col  = pick_col(cols, NAME_PATTERNS) or (cols[0] if cols else None)
+    type_col  = pick_col(cols, TYPE_PATTERNS)
+    from_col  = pick_col(cols, FROM_PATTERNS)
+    to_col    = pick_col(cols, TO_PATTERNS)
+    eta_col   = pick_col(cols, ETA_PATTERNS)
+    speed_col = pick_col(cols, SPEED_PATTERNS)
+    mmsi_col  = pick_col(cols, ["mmsi"])
 
-    ship_col = next((c for c in cols if "type" in c), None)
-    out["ship_type"] = df[ship_col].astype(str).str.title() if ship_col else "Unknown"
+    out: Dict[str, pd.Series] = {}
 
-    last_port_col = next((c for c in cols if "destination" in c or "dest" in c or "from" in c or "origin" in c), None)
-    out["last_port"] = df[last_port_col].astype(str) if last_port_col else None
+    # Name (fallback to first column)
+    out["name"] = df[name_col].astype(str).str.strip() if name_col else pd.Series([None]*len(df))
 
-    eta_col = next((c for c in cols if c == "eta" or "eta" in c), None)
-    out["eta_to_berbera_utc"] = (
-        pd.to_datetime(df[eta_col], errors="coerce", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        if eta_col else None
-    )
+    # MMSI (optional)
+    if mmsi_col:
+        out["mmsi"] = pd.to_numeric(df[mmsi_col].str.replace(r"[^\d]", "", regex=True), errors="coerce")
+    else:
+        out["mmsi"] = pd.NA
 
-    spd_col = next((c for c in cols if "speed" in c or "kn" in c), None)
-    out["speed_kn"] = (
-        pd.to_numeric(df[spd_col].replace(r"[^\d\.]", "", regex=True), errors="coerce")
-        if spd_col else None
-    )
+    # Ship type
+    if type_col:
+        out["ship_type"] = df[type_col].astype(str).str.strip().str.title()
+    else:
+        out["ship_type"] = "Unknown"
 
-    null_mmsi = out["mmsi"].isna() if "mmsi" in out else pd.Series(dtype=bool)
-    if null_mmsi.any():
-        out.loc[null_mmsi, "mmsi"] = out.loc[null_mmsi, "name"].fillna("").map(synth_id)
-    elif "mmsi" not in out:
-        out["mmsi"] = out.get("name", "").fillna("").map(synth_id)
+    # last_port: prefer "from/origin", otherwise "to/destination"
+    if from_col:
+        out["last_port"] = df[from_col].astype(str).str.strip()
+    elif to_col:
+        out["last_port"] = df[to_col].astype(str).str.strip()
+    else:
+        out["last_port"] = pd.NA
 
-    out["distance_nm_to_berbera"] = None
+    # ETA
+    if eta_col:
+        out["eta_to_berbera_utc"] = coerce_eta(df[eta_col])
+    else:
+        out["eta_to_berbera_utc"] = pd.NA
+
+    # speed
+    if speed_col:
+        ser = df[speed_col].astype(str).str.extract(r"([0-9]+(?:\.[0-9]+)?)", expand=False)
+        out["speed_kn"] = pd.to_numeric(ser, errors="coerce")
+    else:
+        out["speed_kn"] = pd.NA
+
+    # defaults
+    out["distance_nm_to_berbera"] = pd.NA
     out["scraped_at_utc"] = now_utc_str()
     out["source"] = "vesselfinder"
     out["status"] = heading_to_status(heading_text) or "unknown"
 
+    out_df = pd.DataFrame(out)
+
+    # MMSI synth if missing
+    if out_df["mmsi"].isna().any():
+        mask = out_df["mmsi"].isna()
+        out_df.loc[mask, "mmsi"] = out_df.loc[mask, "name"].fillna("").map(synth_id)
+
+    # reorder & clean
     for c in APP_COLS:
-        if c not in out.columns:
-            out[c] = None
-    return out[APP_COLS]
+        if c not in out_df.columns:
+            out_df[c] = pd.NA
+    out_df = out_df[APP_COLS]
+    out_df = out_df.dropna(subset=["name"]).replace({pd.NA: None})
+    return out_df
 
 def collect_tables_from_context(ctx) -> List[Tuple[str, str]]:
     results: List[Tuple[str, str]] = []
@@ -236,33 +319,29 @@ def fetch_tables_with_headings(url: str, artifact_dir: str) -> List[Tuple[str, s
             viewport={"width": 1440, "height": 900},
             java_script_enabled=True,
         )
-        # mask webdriver
         context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         page = context.new_page()
         page.set_default_timeout(45000)
 
         print(f"🌐 Navigating: {url}")
-        # Do NOT wait for "networkidle" (many sites never reach it)
         page.goto(url, wait_until="domcontentloaded", timeout=120_000)
 
-        # Give JS some time, try cookie click, then gentle scrolls
         try_click_cookies(page)
-        for _ in range(6):  # scroll more to trigger lazy loads
+        for _ in range(6):
             page.mouse.wheel(0, 1400)
             page.wait_for_timeout(700)
 
-        # Soft wait for any table
         try:
             page.wait_for_selector("table", state="visible", timeout=8000)
         except PWTimeout:
             pass
 
-        # Collect main-page tables
+        # main page
         main_tables = collect_tables_from_context(page)
         print(f"🔎 Tables on main page: {len(main_tables)}")
         results.extend(main_tables)
 
-        # Also inspect iframes
+        # iframes too
         for fr in page.frames:
             if fr == page.main_frame:
                 continue
@@ -274,7 +353,7 @@ def fetch_tables_with_headings(url: str, artifact_dir: str) -> List[Tuple[str, s
             except Exception:
                 continue
 
-        # Save artifacts to inspect what we saw
+        # artifacts
         try:
             os.makedirs(artifact_dir, exist_ok=True)
             with open(os.path.join(artifact_dir, "page.html"), "w", encoding="utf-8") as f:
@@ -288,12 +367,14 @@ def fetch_tables_with_headings(url: str, artifact_dir: str) -> List[Tuple[str, s
         browser.close()
     return results
 
-def normalize_concat(tables: List[Tuple[str, str]]) -> pd.DataFrame:
+def normalize_concat(tables: List[Tuple[str, str]], artifact_dir: str) -> pd.DataFrame:
     if not tables:
         return pd.DataFrame(columns=APP_COLS)
     frames: List[pd.DataFrame] = []
-    for heading, html in tables:
-        frames.append(parse_table_html(html, heading))
+    for idx, (heading, html) in enumerate(tables, start=1):
+        # also save each table as CSV artifact for visibility
+        table_csv = os.path.join(artifact_dir, f"table_{idx:02d}.csv")
+        frames.append(parse_table(html, heading, save_csv_to=table_csv))
     if not frames:
         return pd.DataFrame(columns=APP_COLS)
     df = pd.concat(frames, ignore_index=True)
@@ -313,7 +394,7 @@ def main():
     tables = fetch_tables_with_headings(VF_URL, artifact_dir)
     print(f"✅ Found tables: {len(tables)}")
 
-    df = normalize_concat(tables)
+    df = normalize_concat(tables, artifact_dir)
     print(f"✅ Normalized rows: {len(df)} | cols: {list(df.columns)}")
 
     latest_key, hist_key = write_outputs(df)
