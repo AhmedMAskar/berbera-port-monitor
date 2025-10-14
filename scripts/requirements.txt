@@ -1,7 +1,7 @@
-requests==2.32.3
-beautifulsoup4==4.12.3
-pandas==2.2.2
 psycopg2-binary==2.9.9
-boto3==1.35.41
-lxml==5.3.0
-
+pandas==2.*
+boto3==1.*
+requests==2.*
+playwright==1.*           # for headless browser
+beautifulsoup4==4.*       # pandas.read_html helper
+lxml==5.*                 # pandas.read_html helper
