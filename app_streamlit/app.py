@@ -157,17 +157,6 @@ def latest_timestamp(df: pd.DataFrame) -> Optional[datetime]:
         return None
     return pd.to_datetime(df["scraped_at_utc"], errors="coerce", utc=True).max()
 
-def capacity_stat(df: pd.DataFrame) -> dict:
-    if df.empty or "status" not in df or "scraped_at_utc" not in df:
-        return {"in_port_now":0,"capacity":CAPACITY,"at_capacity":False,"utilization_pct":0.0}
-    max_ts = latest_timestamp(df)
-    if max_ts is None:
-        return {"in_port_now":0,"capacity":CAPACITY,"at_capacity":False,"utilization_pct":0.0}
-    latest = df[df["scraped_at_utc"] == max_ts]
-    in_port_now = latest[latest["status"] == "in_port"]["mmsi"].nunique()
-    pct = round(100 * in_port_now / CAPACITY, 1) if CAPACITY else 0.0
-    return {"in_port_now":in_port_now,"capacity":CAPACITY,"at_capacity":in_port_now>=CAPACITY,"utilization_pct":pct}
-
 def group_counts(df: pd.DataFrame, status: str, freq: str, ship_types: List[str]) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -202,7 +191,7 @@ sig = _s3_head_sig(S3_BUCKET, latest_key)  # (etag, last_modified_iso)
 vf_latest = load_vf_latest_from_s3(sig)
 vf_hist   = load_vf_history_from_s3(sig, limit_keys=600)
 
-# 📄 Show what we actually loaded (helps verify freshness)
+# Diagnostics: what did we actually load
 with st.expander("📄 What did we load from S3?"):
     st.write("Rows in vf_latest:", 0 if vf_latest is None else len(vf_latest))
     if not vf_latest.empty and "scraped_at_utc" in vf_latest.columns:
@@ -211,63 +200,56 @@ with st.expander("📄 What did we load from S3?"):
         st.write("scraped_at_utc range:", str(mmin), "→", str(mmax))
         st.dataframe(vf_latest.head(10), use_container_width=True)
 
+# Prepare unified/all (for charts)
 df_all = pd.concat([vf_hist, vf_latest], ignore_index=True) if not vf_latest.empty else vf_hist
 df_all = unify_schema(df_all).drop_duplicates(subset=["mmsi","scraped_at_utc"], keep="last")
 df_all = add_time_bins(df_all)
 
-# Debug expander
-with st.expander("🔧 Debug – source & counts"):
-    # 🧪 S3 health check (exact object & metadata)
-    try:
-        cli = s3_client()
-        head = cli.head_object(Bucket=S3_BUCKET, Key=latest_key)
-        st.write("🧪 S3 health check")
-        st.write("Bucket:", S3_BUCKET)
-        st.write("Key:", latest_key)
-        st.write("S3 Last-Modified:", head["LastModified"])
-        st.write("S3 ETag:", head["ETag"])
-        st.write("S3 ContentLength (bytes):", head["ContentLength"])
-    except Exception as e:
-        st.error(f"S3 HEAD failed: {e}")
+# ----- Anchor "latest" views on the latest file only -----
+fresh_latest = latest_timestamp(vf_latest)
 
-    # 🔐 Secrets sanity (quick visibility)
-    st.write("S3_BUCKET:", S3_BUCKET)
-    st.write("S3_PREFIX:", S3_PREFIX)
-    st.write("AWS_REGION:", AWS_REGION)
-    st.write("Have Access Key?:", bool(AWS_ACCESS_KEY_ID))
-    st.write("Have Secret Key?:", bool(AWS_SECRET_ACCESS_KEY))
-
-    # Existing debug
-    st.write("Latest signature (etag, last_modified):", sig)
-    st.write("Rows in latest:", 0 if vf_latest is None else len(vf_latest))
-    if not vf_latest.empty:
-        st.write(vf_latest.head(5))
-    if not df_all.empty:
-        st.write("Statuses:", df_all["status"].value_counts(dropna=False))
-
-fresh = latest_timestamp(df_all)
-st.caption(f"Data freshness (latest VF snapshot): {fresh.isoformat() if fresh else 'n/a'}")
+with st.container():
+    if fresh_latest:
+        st.caption(f"Data freshness (from latest file): {fresh_latest.isoformat()}")
+        # If S3 object updated much later than snapshot time, upstream data is stale
+        try:
+            cli = s3_client()
+            head = cli.head_object(Bucket=S3_BUCKET, Key=latest_key)
+            s3_lm = head["LastModified"]
+            if abs((s3_lm - fresh_latest).total_seconds()) > 6*3600:
+                st.info(
+                    f"No new VF snapshot data since {fresh_latest.isoformat()} "
+                    f"(S3 object updated at {s3_lm.isoformat()}). "
+                    "This usually means the source pipeline uploaded the same rows again."
+                )
+        except Exception:
+            pass
+    else:
+        st.caption("Data freshness (from latest file): n/a")
 
 # =========================
-# KPI Row (fixed)
+# KPI Row (based on latest file only)
 # =========================
+def capacity_stat_from_latest(latest_df_all: pd.DataFrame) -> dict:
+    if latest_df_all.empty or "status" not in latest_df_all:
+        return {"in_port_now": 0, "capacity": CAPACITY, "at_capacity": False, "utilization_pct": 0.0}
+    in_port_now = latest_df_all[latest_df_all["status"] == "in_port"]["mmsi"].nunique()
+    pct = round(100 * in_port_now / CAPACITY, 1) if CAPACITY else 0.0
+    return {"in_port_now": in_port_now, "capacity": CAPACITY, "at_capacity": in_port_now >= CAPACITY, "utilization_pct": pct}
+
+latest_slice = pd.DataFrame()
+if fresh_latest:
+    latest_slice = vf_latest[vf_latest["scraped_at_utc"] == fresh_latest]
+
 k1, k2, k3, k4, k5 = st.columns(5)
-
-raw_cap = capacity_stat(df_all)
-cap = raw_cap if isinstance(raw_cap, dict) else {}
-cap.setdefault("in_port_now", 0)
-cap.setdefault("capacity", CAPACITY)
-cap.setdefault("utilization_pct", 0.0)
-cap.setdefault("at_capacity", False)
-
+cap = capacity_stat_from_latest(latest_slice)
 k1.metric("In port (VF)", cap["in_port_now"])
-k2.metric("Capacity", cap["capacity"])
+k2.metric("Capacity", CAPACITY)
 k3.metric("Utilization", f"{cap['utilization_pct']}%")
 
-if fresh:
-    latest_rows = df_all[df_all["scraped_at_utc"] == fresh]
-    k4.metric("Expected (VF)", int((latest_rows["status"] == "expected").sum()))
-    k5.metric("Incoming (VF)", int((latest_rows["status"] == "incoming").sum()))
+if not latest_slice.empty:
+    k4.metric("Expected (VF)", int((latest_slice["status"] == "expected").sum()))
+    k5.metric("Incoming (VF)", int((latest_slice["status"] == "incoming").sum()))
 else:
     k4.metric("Expected (VF)", 0)
     k5.metric("Incoming (VF)", 0)
@@ -303,9 +285,10 @@ st.subheader({
     "expected":"Expected Vessels — Latest",
 }.get(status, "Vessel List — Latest"))
 
+# Latest table (latest file only)
 latest_df = pd.DataFrame()
-if fresh:
-    latest_df = df_all[(df_all["scraped_at_utc"] == fresh) & (df_all["status"] == status)]
+if fresh_latest:
+    latest_df = vf_latest[(vf_latest["scraped_at_utc"] == fresh_latest) & (vf_latest["status"] == status)]
     if selected_types:
         latest_df = latest_df[latest_df["ship_type"].isin(selected_types)]
 
@@ -327,6 +310,7 @@ else:
 
 st.markdown("---")
 
+# Time series uses all (history + latest)
 st.subheader(f"Traffic over time — {freq_label} (distinct vessels, by ship type)")
 grouped = group_counts(df_all, status=status, freq=freq, ship_types=selected_types)
 if grouped.empty:
