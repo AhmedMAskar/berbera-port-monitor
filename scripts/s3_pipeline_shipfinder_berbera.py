@@ -11,6 +11,7 @@ VesselFinder Berbera -> S3 (robust parsing, S3-only, no database)
 - Uploads to:
     s3://<S3_BUCKET>/<S3_PREFIX>/latest/vf_snapshot.csv
     s3://<S3_BUCKET>/<S3_PREFIX>/history/csv/YYYY/MM/DD/HHmm/vf_snapshot_<UTC>.csv
+    s3://<S3_BUCKET>/<S3_PREFIX>/history/in_port/YYYY/MM/DD/HHmm/in_port_<UTC>.csv   (TUG-FREE)
 
 Env (set in GitHub Actions step):
   S3_BUCKET   (required)  e.g., berbera-port-monitor
@@ -86,15 +87,38 @@ def put_csv(bucket: str, key: str, csv_bytes: bytes):
     )
     print(f"✅ Uploaded: s3://{bucket}/{key} (no-cache)")
 
-def write_outputs(df: pd.DataFrame) -> Tuple[str, str]:
+# --- Tug detector: treat any ship_type containing 'tug' (case-insensitive) as tug ---
+def is_tug_series(ser: pd.Series) -> pd.Series:
+    return ser.astype(str).str.contains(r"\btug\b", case=False, na=False)
+
+def write_outputs(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
     ts = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    # 1) rolling latest (full snapshot)
     latest_key = f"{S3_PREFIX}/latest/vf_snapshot.csv"
+
+    # 2) full history snapshot (unaltered / includes tugs)
     hist_prefix = dt.datetime.utcnow().strftime(f"{S3_PREFIX}/history/csv/%Y/%m/%d/%H%M")
     hist_key = f"{hist_prefix}/vf_snapshot_{ts}.csv"
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    put_csv(S3_BUCKET, latest_key, csv_bytes)
-    put_csv(S3_BUCKET, hist_key, csv_bytes)
-    return latest_key, hist_key
+
+    csv_bytes_full = df.to_csv(index=False).encode("utf-8")
+    put_csv(S3_BUCKET, latest_key, csv_bytes_full)
+    put_csv(S3_BUCKET, hist_key,   csv_bytes_full)
+
+    # 3) dedicated in-port history (tug-excluded)
+    in_key = None
+    dfx = df.copy()
+    dfx["status"] = dfx["status"].astype(str).str.lower().str.strip()
+    dfx["ship_type"] = dfx["ship_type"].astype(str).str.strip()
+    df_in = dfx[(dfx["status"] == "in_port") & (~is_tug_series(dfx["ship_type"]))].copy()
+
+    if not df_in.empty:
+        in_prefix = dt.datetime.utcnow().strftime(f"{S3_PREFIX}/history/in_port/%Y/%m/%d/%H%M")
+        in_key = f"{in_prefix}/in_port_{ts}.csv"
+        csv_bytes_in = df_in.to_csv(index=False).encode("utf-8")
+        put_csv(S3_BUCKET, in_key, csv_bytes_in)
+
+    return latest_key, hist_key, in_key
 
 
 # -------------------------
@@ -446,9 +470,11 @@ def main():
     df = normalize_concat(tables, artifact_dir)
     print(f"✅ Normalized rows: {len(df)} | cols: {list(df.columns)}")
 
-    latest_key, hist_key = write_outputs(df)
+    latest_key, hist_key, in_key = write_outputs(df)
     print(f"📝 latest:  s3://{S3_BUCKET}/{latest_key}")
     print(f"🗄️ history: s3://{S3_BUCKET}/{hist_key}")
+    if in_key:
+        print(f"📦 in-port: s3://{S3_BUCKET}/{in_key}")
     print(f"⏱️ Done in {time.time() - t0:.2f}s")
 
 if __name__ == "__main__":
