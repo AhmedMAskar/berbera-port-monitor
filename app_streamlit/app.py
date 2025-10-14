@@ -6,7 +6,6 @@
 # - Tables for In-Port / Incoming / Outgoing / Expected
 # - Charts: Daily/Weekly/Monthly/Yearly, stacked by ship type
 # - Capacity stat (in-port vs capacity)
-# - Built-in S3 health + cache-bust diagnostics
 # ------------------------------------------------------------
 
 import os
@@ -31,11 +30,26 @@ S3_PREFIX   = (st.secrets.get("S3_PREFIX")   or os.getenv("S3_PREFIX")   or "ber
 AWS_REGION  = (st.secrets.get("AWS_REGION")  or os.getenv("AWS_REGION")  or None)
 CAPACITY    = int(st.secrets.get("IN_PORT_CAPACITY", os.getenv("IN_PORT_CAPACITY", 10)))
 
-# Read-only AWS creds (Streamlit)
+# Read-only AWS creds (Option A)
 AWS_ACCESS_KEY_ID     = (st.secrets.get("AWS_ACCESS_KEY_ID")     or os.getenv("AWS_ACCESS_KEY_ID"))
 AWS_SECRET_ACCESS_KEY = (st.secrets.get("AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY"))
 
 KNOWN_STATUSES = ["in_port", "incoming", "outgoing", "expected"]
+
+# Some ship-type phrases often appended to names on VF
+KNOWN_TYPE_PHRASES = [
+    "General Cargo Ship",
+    "Container Ship",
+    "Bulk Carrier",
+    "Cargo ship",
+    "Oil Products Tanker",
+    "Chemical/Oil Products Tanker",
+    "Sailing vessel",
+    "Livestock Carrier",
+    "Tug",
+    "Ro-Ro/Passenger Ship",
+    "Passenger Ship",
+]
 
 # =========================
 # S3 helpers + cache-buster
@@ -59,17 +73,19 @@ def _read_csv_from_s3(bucket: str, key: str) -> pd.DataFrame:
     obj = s3.get_object(Bucket=bucket, Key=key)
     return pd.read_csv(io.BytesIO(obj["Body"].read()))
 
-@st.cache_data(ttl=60)
-def _s3_head_sig(bucket: str, key: str) -> Tuple[str, str]:
-    """Return (etag, last_modified_iso) so any change busts cache."""
-    resp = s3_client().head_object(Bucket=bucket, Key=key)
+@st.cache_data(ttl=0)
+def _s3_head_meta(bucket: str, key: str) -> Tuple[str, str, int]:
+    """(etag, last_modified_iso, size_bytes) for cache-busting + debug."""
+    s3 = s3_client()
+    resp = s3.head_object(Bucket=bucket, Key=key)
     etag = resp.get("ETag", "").strip('"')
     lm = resp.get("LastModified")
-    lm_iso = lm.isoformat() if lm is not None else ""
-    return etag, lm_iso
+    lm_iso = lm.astimezone(timezone.utc).isoformat() if lm else ""
+    size = resp.get("ContentLength", 0)
+    return etag, lm_iso, size
 
 @st.cache_data(ttl=0)
-def load_vf_latest_from_s3(cache_bust_sig: Tuple[str, str]) -> pd.DataFrame:
+def load_vf_latest_from_s3(cache_bust: str) -> pd.DataFrame:
     key = f"{S3_PREFIX}/latest/vf_snapshot.csv"
     try:
         return _read_csv_from_s3(S3_BUCKET, key)
@@ -92,7 +108,7 @@ def list_history_keys(limit: int = 500) -> List[str]:
     return keys[-limit:]
 
 @st.cache_data(ttl=0)
-def load_vf_history_from_s3(cache_bust_sig: Tuple[str, str], limit_keys: int = 500) -> pd.DataFrame:
+def load_vf_history_from_s3(cache_bust: str, limit_keys: int = 500) -> pd.DataFrame:
     keys = list_history_keys(limit=limit_keys)
     if not keys:
         return pd.DataFrame()
@@ -117,6 +133,21 @@ def load_vf_history_from_s3(cache_bust_sig: Tuple[str, str], limit_keys: int = 5
 # =========================
 # Data prep / metrics
 # =========================
+def split_name_and_type(raw: str) -> Tuple[str, Optional[str]]:
+    """If a name contains a known type suffix, split it out."""
+    if not isinstance(raw, str):
+        return "", None
+    txt = raw.strip()
+    # fuzzy match ignoring spaces
+    for phrase in sorted(KNOWN_TYPE_PHRASES, key=len, reverse=True):
+        if phrase.replace(" ", "").lower() in txt.replace(" ", "").lower():
+            low = txt.lower()
+            idx = low.rfind(phrase.lower())
+            if idx != -1:
+                name_part = txt[:idx].strip(" -–—·")
+                return (name_part.strip(), phrase)
+    return (txt, None)
+
 def coerce_timestamps(df: pd.DataFrame) -> pd.DataFrame:
     if "scraped_at_utc" in df.columns:
         df["scraped_at_utc"] = pd.to_datetime(df["scraped_at_utc"], errors="coerce", utc=True)
@@ -132,6 +163,20 @@ def unify_schema(df: pd.DataFrame) -> pd.DataFrame:
     for c in needed:
         if c not in df.columns:
             df[c] = None
+
+    # If ship_type is blank/Unknown but embedded in name, extract it
+    if "ship_type" in df.columns and "name" in df.columns:
+        mask_unknown = df["ship_type"].isna() | (df["ship_type"].astype(str).str.strip().isin(["", "Unknown", "None"]))
+        if mask_unknown.any():
+            names = df.loc[mask_unknown, "name"].astype(str).tolist()
+            new_names, inferred_types = [], []
+            for n in names:
+                nn, it = split_name_and_type(n)
+                new_names.append(nn)
+                inferred_types.append(it if it else "Unknown")
+            df.loc[mask_unknown, "name"] = new_names
+            df.loc[mask_unknown, "ship_type"] = inferred_types
+
     df["status"] = df["status"].astype(str).str.strip().str.lower()
     df["ship_type"] = df["ship_type"].astype(str).str.strip().str.title()
     df = coerce_timestamps(df)
@@ -186,78 +231,90 @@ with top:
             st.rerun()
 
 latest_key = f"{S3_PREFIX}/latest/vf_snapshot.csv"
-sig = _s3_head_sig(S3_BUCKET, latest_key)  # (etag, last_modified_iso)
+etag, last_modified_iso, size_bytes = _s3_head_meta(S3_BUCKET, latest_key)  # cache-buster & debug
 
-vf_latest = load_vf_latest_from_s3(sig)
-vf_hist   = load_vf_history_from_s3(sig, limit_keys=600)
+vf_latest = load_vf_latest_from_s3(etag)
+vf_hist   = load_vf_history_from_s3(etag, limit_keys=600)
 
-# Diagnostics: what did we actually load
-with st.expander("📄 What did we load from S3?"):
-    st.write("Rows in vf_latest:", 0 if vf_latest is None else len(vf_latest))
-    if not vf_latest.empty and "scraped_at_utc" in vf_latest.columns:
-        mmin = pd.to_datetime(vf_latest["scraped_at_utc"], errors="coerce").min()
-        mmax = pd.to_datetime(vf_latest["scraped_at_utc"], errors="coerce").max()
-        st.write("scraped_at_utc range:", str(mmin), "→", str(mmax))
-        st.dataframe(vf_latest.head(10), use_container_width=True)
-
-# Prepare unified/all (for charts)
 df_all = pd.concat([vf_hist, vf_latest], ignore_index=True) if not vf_latest.empty else vf_hist
 df_all = unify_schema(df_all).drop_duplicates(subset=["mmsi","scraped_at_utc"], keep="last")
 df_all = add_time_bins(df_all)
 
-# ----- Anchor "latest" views on the latest file only -----
-fresh_latest = latest_timestamp(vf_latest)
+# Debug expander
+with st.expander("🔧 Debug – source & counts"):
+    st.subheader("🧪 S3 health check")
+    st.write("Bucket:", S3_BUCKET)
+    st.write("Key:", latest_key)
+    st.write("S3 Last-Modified:", last_modified_iso)
+    st.write("S3 ETag:", etag)
+    st.write("S3 ContentLength (bytes):", size_bytes)
 
-with st.container():
-    if fresh_latest:
-        st.caption(f"Data freshness (from latest file): {fresh_latest.isoformat()}")
-        # If S3 object updated much later than snapshot time, upstream data is stale
+    st.write("S3_BUCKET:", S3_BUCKET)
+    st.write("S3_PREFIX:", S3_PREFIX)
+    st.write("AWS_REGION:", AWS_REGION)
+    st.write("Have Access Key?:", bool(AWS_ACCESS_KEY_ID))
+    st.write("Have Secret Key?:", bool(AWS_SECRET_ACCESS_KEY))
+
+    st.write("Rows in vf_latest:", 0 if vf_latest is None else len(vf_latest))
+    if not vf_latest.empty:
         try:
-            cli = s3_client()
-            head = cli.head_object(Bucket=S3_BUCKET, Key=latest_key)
-            s3_lm = head["LastModified"]
-            if abs((s3_lm - fresh_latest).total_seconds()) > 6*3600:
-                st.info(
-                    f"No new VF snapshot data since {fresh_latest.isoformat()} "
-                    f"(S3 object updated at {s3_lm.isoformat()}). "
-                    "This usually means the source pipeline uploaded the same rows again."
-                )
+            rng_min = pd.to_datetime(vf_latest["scraped_at_utc"], errors="coerce", utc=True).min()
+            rng_max = pd.to_datetime(vf_latest["scraped_at_utc"], errors="coerce", utc=True).max()
+            st.write("scraped_at_utc range:", rng_min, "→", rng_max)
         except Exception:
             pass
-    else:
-        st.caption("Data freshness (from latest file): n/a")
+        st.write(vf_latest.head(10))
+
+    if not df_all.empty:
+        st.write("Statuses:", df_all["status"].value_counts(dropna=False))
 
 # =========================
-# KPI Row (based on latest file only)
+# KPI Row (robust to timestamp equality)
 # =========================
-def capacity_stat_from_latest(latest_df_all: pd.DataFrame) -> dict:
-    if latest_df_all.empty or "status" not in latest_df_all:
-        return {"in_port_now": 0, "capacity": CAPACITY, "at_capacity": False, "utilization_pct": 0.0}
-    in_port_now = latest_df_all[latest_df_all["status"] == "in_port"]["mmsi"].nunique()
+def compute_latest_rows() -> pd.DataFrame:
+    # Prefer the explicit latest file we just read
+    if isinstance(vf_latest, pd.DataFrame) and not vf_latest.empty:
+        df = unify_schema(vf_latest.copy())
+        df = coerce_timestamps(df)
+        if "scraped_at_utc" in df.columns:
+            df["scraped_at_utc"] = pd.to_datetime(df["scraped_at_utc"], utc=True, errors="coerce").dt.floor("s")
+        return df
+
+    # Fallback: use df_all at its max timestamp
+    if "scraped_at_utc" in df_all and not df_all.empty:
+        dfx = df_all.copy()
+        dfx["scraped_at_utc"] = pd.to_datetime(dfx["scraped_at_utc"], utc=True, errors="coerce").dt.floor("s")
+        max_ts = dfx["scraped_at_utc"].max()
+        return dfx[dfx["scraped_at_utc"] == max_ts]
+
+    return pd.DataFrame()
+
+latest_rows_for_kpi = compute_latest_rows()
+
+def capacity_stat_from_latest(latest_df: pd.DataFrame) -> dict:
+    if latest_df.empty:
+        return {"in_port_now":0,"capacity":CAPACITY,"at_capacity":False,"utilization_pct":0.0}
+    in_port_now = latest_df[latest_df["status"] == "in_port"]["mmsi"].nunique()
     pct = round(100 * in_port_now / CAPACITY, 1) if CAPACITY else 0.0
     return {"in_port_now": in_port_now, "capacity": CAPACITY, "at_capacity": in_port_now >= CAPACITY, "utilization_pct": pct}
 
-latest_slice = pd.DataFrame()
-if fresh_latest:
-    latest_slice = vf_latest[vf_latest["scraped_at_utc"] == fresh_latest]
+cap = capacity_stat_from_latest(latest_rows_for_kpi)
 
 k1, k2, k3, k4, k5 = st.columns(5)
-cap = capacity_stat_from_latest(latest_slice)
 k1.metric("In port (VF)", cap["in_port_now"])
-k2.metric("Capacity", CAPACITY)
+k2.metric("Capacity", cap["capacity"])
 k3.metric("Utilization", f"{cap['utilization_pct']}%")
-
-if not latest_slice.empty:
-    k4.metric("Expected (VF)", int((latest_slice["status"] == "expected").sum()))
-    k5.metric("Incoming (VF)", int((latest_slice["status"] == "incoming").sum()))
-else:
-    k4.metric("Expected (VF)", 0)
-    k5.metric("Incoming (VF)", 0)
+k4.metric("Expected (VF)", int((latest_rows_for_kpi["status"] == "expected").sum()))
+k5.metric("Incoming (VF)", int((latest_rows_for_kpi["status"] == "incoming").sum()))
 
 if cap["at_capacity"]:
     st.warning("Port is at or above capacity.")
 else:
     st.success("Port is below capacity.")
+
+fresh_ts = latest_rows_for_kpi["scraped_at_utc"].max() if not latest_rows_for_kpi.empty else None
+st.caption(f"Data freshness (from latest file): {fresh_ts.isoformat() if fresh_ts is not None else 'n/a'}")
+st.caption(f"Latest snapshot rows used for KPIs: {len(latest_rows_for_kpi)}")
 
 st.markdown("---")
 
@@ -285,44 +342,31 @@ st.subheader({
     "expected":"Expected Vessels — Latest",
 }.get(status, "Vessel List — Latest"))
 
-# Latest table (latest file only)
-latest_df = pd.DataFrame()
-if fresh_latest:
-    latest_df = vf_latest[(vf_latest["scraped_at_utc"] == fresh_latest) & (vf_latest["status"] == status)]
+# Use the same 'latest' snapshot the KPIs use
+latest_df = latest_rows_for_kpi.copy()
+if not latest_df.empty:
+    if status:
+        latest_df = latest_df[latest_df["status"] == status]
     if selected_types:
         latest_df = latest_df[latest_df["ship_type"].isin(selected_types)]
 
-cols = [
-    "name","mmsi","ship_type","status","last_port",
-    "distance_nm_to_berbera","eta_to_berbera_utc","speed_kn",
-    "scraped_at_utc","source"
-]
+cols = ["name","mmsi","ship_type","status","last_port","distance_nm_to_berbera","eta_to_berbera_utc","speed_kn","scraped_at_utc","source"]
 if latest_df.empty:
     st.info("No rows for the current filter yet.")
 else:
     st.dataframe(latest_df[cols], use_container_width=True, hide_index=True)
-    st.download_button(
-        "⬇️ Download CSV",
-        data=latest_df[cols].to_csv(index=False).encode("utf-8"),
-        file_name=f"{status}_latest.csv",
-        mime="text/csv"
-    )
+    st.download_button("⬇️ Download CSV",
+                       data=latest_df[cols].to_csv(index=False).encode("utf-8"),
+                       file_name=f"{status}_latest.csv", mime="text/csv")
 
 st.markdown("---")
 
-# Time series uses all (history + latest)
 st.subheader(f"Traffic over time — {freq_label} (distinct vessels, by ship type)")
 grouped = group_counts(df_all, status=status, freq=freq, ship_types=selected_types)
 if grouped.empty:
     st.info("No time series yet for the selected filters.")
 else:
-    fig = px.area(
-        grouped, x="ts", y="count", color="ship_type",
-        labels={"ts":"Time","count":"Distinct vessels"}
-    )
-    fig.update_layout(
-        legend_title_text="Ship type",
-        hovermode="x unified",
-        margin=dict(l=0, r=0, t=10, b=0)
-    )
+    fig = px.area(grouped, x="ts", y="count", color="ship_type",
+                  labels={"ts":"Time","count":"Distinct vessels"})
+    fig.update_layout(legend_title_text="Ship type", hovermode="x unified", margin=dict(l=0,r=0,t=10,b=0))
     st.plotly_chart(fig, use_container_width=True)
