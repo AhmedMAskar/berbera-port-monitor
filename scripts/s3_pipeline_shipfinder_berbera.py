@@ -1,12 +1,12 @@
 # scripts/s3_pipeline_shipfinder_berbera.py
 """
-Automated S3-only pipeline for VesselFinder Berbera page:
-- Headless Playwright with realistic UA and webdriver masking.
-- Handles cookie/consent if present.
-- Waits & scrolls to trigger lazy content.
-- Searches tables in main page and in iframes.
-- Saves HTML/screenshot artifacts if no tables found.
-- Normalizes & uploads:
+Automated S3-only pipeline for VesselFinder Berbera page (Playwright, hardened):
+- Uses realistic UA and masks webdriver.
+- NO 'networkidle' wait (many sites never get idle).
+- Gentle waits + scroll to trigger lazy content.
+- Searches tables on main page and in iframes.
+- Saves page.html & screenshot.png artifacts for debugging.
+- Uploads CSV to:
     s3://<S3_BUCKET>/<S3_PREFIX>/latest/vf_snapshot.csv
     s3://<S3_BUCKET>/<S3_PREFIX>/history/csv/YYYY/MM/DD/HHmm/vf_snapshot_<UTC>.csv
 
@@ -61,6 +61,12 @@ APP_COLS = [
     "scraped_at_utc","source"
 ]
 
+REAL_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
+
 def synth_id(name: str) -> int:
     return 0 if not name else abs(zlib.crc32(name.encode("utf-8")))
 
@@ -90,14 +96,8 @@ def write_outputs(df: pd.DataFrame) -> Tuple[str, str]:
 # -------------------------
 # Scrape utilities
 # -------------------------
-REAL_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0.0.0 Safari/537.36"
-)
-
 def try_click_cookies(page):
-    # Attempt common cookie/consent buttons
+    # attempt generic cookie banners; ignore failures
     selectors = [
         "button:has-text('Accept')",
         "button:has-text('I Agree')",
@@ -106,16 +106,16 @@ def try_click_cookies(page):
         "text=Accept All",
         "[id*='accept']",
         "[class*='accept']",
+        "[aria-label*='accept']",
     ]
     for sel in selectors:
         try:
-            if page.locator(sel).first.is_visible():
-                page.locator(sel).first.click(timeout=1000)
+            loc = page.locator(sel).first
+            if loc.is_visible():
+                loc.click(timeout=1000)
                 page.wait_for_timeout(500)
                 print(f"🔘 Clicked consent: {sel}")
                 return True
-        except PWTimeout:
-            pass
         except Exception:
             pass
     return False
@@ -143,10 +143,7 @@ def parse_table_html(table_html: str, heading_text: str) -> pd.DataFrame:
     out["name"] = df[name_col].astype(str).str.strip() if name_col else None
 
     mmsi_col = next((c for c in cols if "mmsi" in c), None)
-    if mmsi_col:
-        out["mmsi"] = pd.to_numeric(df[mmsi_col], errors="coerce")
-    else:
-        out["mmsi"] = None
+    out["mmsi"] = pd.to_numeric(df[mmsi_col], errors="coerce") if mmsi_col else None
 
     ship_col = next((c for c in cols if "type" in c), None)
     out["ship_type"] = df[ship_col].astype(str).str.title() if ship_col else "Unknown"
@@ -155,20 +152,22 @@ def parse_table_html(table_html: str, heading_text: str) -> pd.DataFrame:
     out["last_port"] = df[last_port_col].astype(str) if last_port_col else None
 
     eta_col = next((c for c in cols if c == "eta" or "eta" in c), None)
-    if eta_col:
-        out["eta_to_berbera_utc"] = pd.to_datetime(df[eta_col], errors="coerce", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    else:
-        out["eta_to_berbera_utc"] = None
+    out["eta_to_berbera_utc"] = (
+        pd.to_datetime(df[eta_col], errors="coerce", utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if eta_col else None
+    )
 
     spd_col = next((c for c in cols if "speed" in c or "kn" in c), None)
-    if spd_col:
-        out["speed_kn"] = pd.to_numeric(df[spd_col].replace(r"[^\d\.]", "", regex=True), errors="coerce")
-    else:
-        out["speed_kn"] = None
+    out["speed_kn"] = (
+        pd.to_numeric(df[spd_col].replace(r"[^\d\.]", "", regex=True), errors="coerce")
+        if spd_col else None
+    )
 
-    null_mmsi = out["mmsi"].isna()
+    null_mmsi = out["mmsi"].isna() if "mmsi" in out else pd.Series(dtype=bool)
     if null_mmsi.any():
         out.loc[null_mmsi, "mmsi"] = out.loc[null_mmsi, "name"].fillna("").map(synth_id)
+    elif "mmsi" not in out:
+        out["mmsi"] = out.get("name", "").fillna("").map(synth_id)
 
     out["distance_nm_to_berbera"] = None
     out["scraped_at_utc"] = now_utc_str()
@@ -181,29 +180,27 @@ def parse_table_html(table_html: str, heading_text: str) -> pd.DataFrame:
     return out[APP_COLS]
 
 def collect_tables_from_context(ctx) -> List[Tuple[str, str]]:
-    # ctx is a Playwright "Locator" context (either page or frame)
     results: List[Tuple[str, str]] = []
     tables = ctx.locator("table")
-    count = tables.count()
+    try:
+        count = tables.count()
+    except Exception:
+        count = 0
     for i in range(count):
         t = tables.nth(i)
         heading_text = ""
-        # nearest previous heading within the same parent chain
         try:
             heading_text = t.evaluate("""
                 el => {
                   function text(el){ return (el && el.textContent||'').trim(); }
-                  // Walk up: search within siblings then parents for h1..h3
                   let cur = el;
                   for (let steps=0; steps<6 && cur; steps++) {
-                    // previous siblings
                     let sib = cur.previousElementSibling;
                     let checks = 0;
                     while (sib && checks < 8) {
                       if (['H1','H2','H3'].includes(sib.tagName)) return text(sib);
                       sib = sib.previousElementSibling; checks++;
                     }
-                    // parent
                     cur = cur.parentElement;
                     if (cur) {
                       const h = cur.querySelector('h1,h2,h3');
@@ -215,15 +212,25 @@ def collect_tables_from_context(ctx) -> List[Tuple[str, str]]:
             """) or ""
         except Exception:
             heading_text = ""
-        table_html = t.evaluate("el => el.outerHTML")
-        if table_html:
-            results.append((heading_text.lower(), table_html))
+        try:
+            table_html = t.evaluate("el => el.outerHTML")
+            if table_html:
+                results.append((heading_text.lower(), table_html))
+        except Exception:
+            continue
     return results
 
 def fetch_tables_with_headings(url: str, artifact_dir: str) -> List[Tuple[str, str]]:
     results: List[Tuple[str, str]] = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         context = browser.new_context(
             user_agent=REAL_UA,
             viewport={"width": 1440, "height": 900},
@@ -235,53 +242,47 @@ def fetch_tables_with_headings(url: str, artifact_dir: str) -> List[Tuple[str, s
         page.set_default_timeout(45000)
 
         print(f"🌐 Navigating: {url}")
+        # Do NOT wait for "networkidle" (many sites never reach it)
         page.goto(url, wait_until="domcontentloaded", timeout=120_000)
-        # extra waits for dynamic content
-        page.wait_for_load_state("networkidle", timeout=60000)
+
+        # Give JS some time, try cookie click, then gentle scrolls
         try_click_cookies(page)
+        for _ in range(6):  # scroll more to trigger lazy loads
+            page.mouse.wheel(0, 1400)
+            page.wait_for_timeout(700)
 
-        # Scroll to trigger lazy content
-        for _ in range(4):
-            page.mouse.wheel(0, 1600)
-            page.wait_for_timeout(600)
-
-        # Try main page first
+        # Soft wait for any table
         try:
-            # Wait for at least one table if possible (soft wait)
-            page.wait_for_selector("table", state="visible", timeout=5000)
+            page.wait_for_selector("table", state="visible", timeout=8000)
         except PWTimeout:
             pass
 
+        # Collect main-page tables
         main_tables = collect_tables_from_context(page)
-        print(f"🔎 Tables found in main page: {len(main_tables)}")
+        print(f"🔎 Tables on main page: {len(main_tables)}")
         results.extend(main_tables)
 
-        # Also inspect iframes (some sites embed tables in frames)
-        frames = page.frames
-        for fr in frames:
+        # Also inspect iframes
+        for fr in page.frames:
             if fr == page.main_frame:
                 continue
             try:
-                locator = fr.locator("table")
-                if locator.count() > 0:
+                if fr.locator("table").count() > 0:
                     ftables = collect_tables_from_context(fr)
-                    print(f"🔎 Tables found in iframe: {len(ftables)}")
+                    print(f"🔎 Tables in iframe: {len(ftables)}")
                     results.extend(ftables)
             except Exception:
                 continue
 
-        # Save artifacts if nothing found
-        if not results:
-            try:
-                html_path = os.path.join(artifact_dir, "page.html")
-                png_path = os.path.join(artifact_dir, "screenshot.png")
-                os.makedirs(artifact_dir, exist_ok=True)
-                with open(html_path, "w", encoding="utf-8") as f:
-                    f.write(page.content())
-                page.screenshot(path=png_path, full_page=True)
-                print(f"🧩 Saved artifacts: {html_path}, {png_path}")
-            except Exception as e:
-                print(f"⚠️ Could not save artifacts: {e}")
+        # Save artifacts to inspect what we saw
+        try:
+            os.makedirs(artifact_dir, exist_ok=True)
+            with open(os.path.join(artifact_dir, "page.html"), "w", encoding="utf-8") as f:
+                f.write(page.content())
+            page.screenshot(path=os.path.join(artifact_dir, "screenshot.png"), full_page=True)
+            print("🧩 Saved artifacts: scrape_artifacts/page.html & screenshot.png")
+        except Exception as e:
+            print(f"⚠️ Could not save artifacts: {e}")
 
         context.close()
         browser.close()
