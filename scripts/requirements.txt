@@ -1,19 +1,19 @@
+# =============================
+# Berbera Port Monitor — Scraper
+# =============================
+
 # Core
 pandas>=2.2
 numpy>=1.26
+python-dateutil>=2.9
 
-# App
-streamlit>=1.38
-plotly>=5.22
-folium>=0.17
-
-# Scraping
+# Web scraping & parsing
 playwright>=1.47
 beautifulsoup4>=4.12
 lxml>=5.2
 
-# AWS / IO
+# AWS S3 upload
 boto3>=1.34
 
-# Misc
-python-dateutil>=2.9
+# Compression & misc
+zlib-state>=0.1.5 ; sys_platform == "fake" # optional stub (zlib is stdlib)
