@@ -2,12 +2,9 @@
 # ------------------------------------------------------------
 # Berbera Port Monitor — TEU (Port-Calls · Enrichment · Map)
 # ------------------------------------------------------------
-# - Reads S3 CSVs written by scripts/s3_pipeline_shipfinder_berbera.py
-# - Excludes tugs globally
-# - TEU/TEU-equivalent computed or read from CSV
-# - Port-call detection (arrivals/departures, dwell, call-based TEU counting)
-# - SLA flags on dwell, route/line summaries, direction compass
-# - Directional map (schematic rays) + Wind-rose over time
+# - Robust against missing optional columns in history snapshots
+# - Shows real polylines when lat/lon exist, else schematic rays
+# - Marks in_port ships even without bearings
 # ------------------------------------------------------------
 
 import os
@@ -148,10 +145,10 @@ def unify_schema(df: pd.DataFrame) -> pd.DataFrame:
         "distance_nm_to_berbera","eta_to_berbera_utc","speed_kn",
         "gt","dwt","length_m","beam_m","built_year",
         "teu_capacity_actual","teu_equiv","source",
-        # enrichment fields
+        # enrichment fields (may or may not be present in older history)
         "detail_url","destination","last_port_detailed","atd_last_port_utc",
         "course_deg","heading_deg","nav_status","direction_cardinal",
-        "position_age_min","flag","imo","callsign",
+        "position_age_min","flag","imo","callsign","lat_deg","lon_deg",
     ]
     for c in needed:
         if c not in df.columns:
@@ -160,7 +157,8 @@ def unify_schema(df: pd.DataFrame) -> pd.DataFrame:
     df["ship_type"] = df["ship_type"].astype(str).str.strip().str.title()
     df = coerce_timestamps(df)
     for c in ["distance_nm_to_berbera","speed_kn","gt","dwt","length_m","beam_m","built_year",
-              "teu_equiv","teu_capacity_actual","course_deg","heading_deg","position_age_min"]:
+              "teu_equiv","teu_capacity_actual","course_deg","heading_deg",
+              "position_age_min","lat_deg","lon_deg"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
@@ -231,6 +229,19 @@ df_all = _exclude_tugs(df_all)
 df_all = ensure_teu_equiv(df_all)
 
 # =========================
+# Helpers
+# =========================
+def safe_cols(df: pd.DataFrame, wanted: list[str]) -> list[str]:
+    return [c for c in wanted if c in df.columns]
+
+def compute_latest_rows() -> pd.DataFrame:
+    if not vf_latest.empty:
+        df = unify_schema(vf_latest.copy()); df = _exclude_tugs(df); df = ensure_teu_equiv(df); return df
+    if not df_all.empty:
+        max_ts = df_all["scraped_at_utc"].max(); return df_all[df_all["scraped_at_utc"] == max_ts]
+    return pd.DataFrame()
+
+# =========================
 # Port-call detection + SLA
 # =========================
 @st.cache_data(ttl=0)
@@ -252,7 +263,7 @@ def build_port_calls(df: pd.DataFrame) -> pd.DataFrame:
             ts = r["scraped_at_utc"]; status = (r["status"] or "").lower()
             teu = float(r.get("teu_equiv") or 0.0); lp  = r.get("last_port"); lpd = r.get("last_port_detailed")
             if (not in_call) and status == "in_port":
-                in_call, call_start = True, ts; call_teus=[teu]; 
+                in_call, call_start = True, ts; call_teus=[teu]
                 if pd.notna(lp):  lps.append(lp)
                 if pd.notna(lpd): lpds.append(lpd)
                 continue
@@ -324,13 +335,6 @@ def kpi_values(latest_df: pd.DataFrame, calls_df: pd.DataFrame) -> dict:
     return dict(in_port_teu=in_port_teu,daily_pct=daily_pct,weekly_teu=weekly_teu,weekly_pct=weekly_pct,
                 monthly_teu=monthly_teu,monthly_pct=monthly_pct)
 
-def compute_latest_rows() -> pd.DataFrame:
-    if not vf_latest.empty:
-        df = unify_schema(vf_latest.copy()); df = _exclude_tugs(df); df = ensure_teu_equiv(df); return df
-    if not df_all.empty:
-        max_ts = df_all["scraped_at_utc"].max(); return df_all[df_all["scraped_at_utc"] == max_ts]
-    return pd.DataFrame()
-
 latest_rows = compute_latest_rows()
 k = kpi_values(latest_rows, port_calls)
 
@@ -348,7 +352,7 @@ st.caption(f"Data freshness: {fresh_ts.isoformat() if fresh_ts is not None else 
 st.markdown("---")
 
 # =========================
-# Current status (enriched prefs)
+# Current status (enriched)
 # =========================
 statuses_present = sorted(set(x for x in df_all["status"].dropna().unique() if x in KNOWN_STATUSES)) or KNOWN_STATUSES
 status = st.selectbox("View", statuses_present, index=0)
@@ -363,14 +367,14 @@ if not latest_df.empty:
 latest_df["route_last_port"] = latest_df["last_port_detailed"].fillna(latest_df["last_port"])
 latest_df["dir"] = latest_df["direction_cardinal"].fillna("")
 
-cols = [
+cols_latest = [
     "name","mmsi","ship_type","status","route_last_port","destination","dir",
     "gt","dwt","length_m","beam_m","teu_equiv","eta_to_berbera_utc",
-    "speed_kn","course_deg","scraped_at_utc","detail_url"
+    "speed_kn","course_deg","lat_deg","lon_deg","scraped_at_utc","detail_url"
 ]
 st.subheader(f"Latest — {status} (tug-free, enriched)")
-st.dataframe(latest_df[cols], use_container_width=True, hide_index=True)
-st.download_button("⬇️ Download CSV", latest_df[cols].to_csv(index=False).encode("utf-8"),
+st.dataframe(latest_df[safe_cols(latest_df, cols_latest)], use_container_width=True, hide_index=True)
+st.download_button("⬇️ Download CSV", latest_df[safe_cols(latest_df, cols_latest)].to_csv(index=False).encode("utf-8"),
                    file_name=f"{status}_latest_teu.csv", mime="text/csv")
 
 st.markdown("---")
@@ -378,14 +382,13 @@ st.markdown("---")
 # =========================
 # Directional Map — Berbera vicinity
 # =========================
-st.subheader("Map — Berbera & Vicinity (Directional Rays)")
+st.subheader("Map — Berbera & Vicinity (Real Segments when possible)")
 
 def bearing_from_cardinal(card: str) -> Optional[float]:
     m = {"N":0,"NE":45,"E":90,"SE":135,"S":180,"SW":225,"W":270,"NW":315}
     return m.get(str(card).upper()) if isinstance(card, str) else None
 
 def destination_point(lat, lon, bearing_deg, distance_km):
-    # simple great-circle forward calculation (spherical Earth)
     R = 6371.0088  # km
     φ1 = math.radians(lat); λ1 = math.radians(lon); θ = math.radians(bearing_deg); d = distance_km
     φ2 = math.asin(math.sin(φ1)*math.cos(d/R) + math.cos(φ1)*math.sin(d/R)*math.cos(θ))
@@ -399,6 +402,7 @@ def direction_ray(lat0, lon0, bearing_deg, length_km=60):
 
 incoming_df = latest_rows[(latest_rows["status"]=="incoming")].copy()
 outgoing_df = latest_rows[(latest_rows["status"]=="outgoing")].copy()
+inport_df   = latest_rows[(latest_rows["status"]=="in_port")].copy()
 
 def get_bearing(row):
     if pd.notna(row.get("course_deg")):
@@ -409,47 +413,76 @@ def get_bearing(row):
 
 m = folium.Map(location=[BERBERA_LAT, BERBERA_LON], tiles="OpenStreetMap", zoom_start=10, control_scale=True)
 
-# Port marker
 folium.Marker([BERBERA_LAT, BERBERA_LON],
               tooltip="Berbera Port",
               popup="Berbera Port",
               icon=folium.Icon(color="blue", icon="anchor", prefix="fa")).add_to(m)
 
-fg_in  = FeatureGroup(name="Incoming (rays toward port)", show=True)
-fg_out = FeatureGroup(name="Outgoing (rays away from port)", show=True)
+fg_in  = FeatureGroup(name="Incoming", show=True)
+fg_out = FeatureGroup(name="Outgoing", show=True)
+fg_berth = FeatureGroup(name="In-Port markers", show=True)
 
-# Incoming rays
+def add_ship_segment_or_ray(row, layer, mode: str):
+    """
+    mode = 'incoming' or 'outgoing'
+    If row has lat_deg/lon_deg, draw a real segment; else fallback to schematic ray.
+    """
+    name = row.get("name","")
+    lp   = row.get("last_port_detailed") or row.get("last_port") or ""
+    dest = row.get("destination") or ("Berbera" if mode=="incoming" else "")
+    b    = get_bearing(row)
+    lat  = row.get("lat_deg")
+    lon  = row.get("lon_deg")
+
+    if mode == "incoming":
+        pop = f"<b>{name}</b><br>From: {lp}<br>To: {dest}{('<br>Bearing: %d°'%round(b)) if b is not None else ''}"
+        color = "#2ca02c"
+    else:
+        pop = f"<b>{name}</b><br>To: {dest}{('<br>Bearing: %d°'%round(b)) if b is not None else ''}"
+        color = "#d62728"
+
+    if pd.notna(lat) and pd.notna(lon):
+        pts = ([(lat, lon), (BERBERA_LAT, BERBERA_LON)] if mode=="incoming"
+               else [(BERBERA_LAT, BERBERA_LON), (lat, lon)])
+        folium.PolyLine(pts, weight=5, opacity=0.8, color=color, tooltip=name, popup=pop).add_to(layer)
+        folium.CircleMarker(location=(lat, lon), radius=5, tooltip=name, popup=pop, color=color, fill=True).add_to(layer)
+    else:
+        if b is None:
+            return
+        ray = direction_ray(BERBERA_LAT, BERBERA_LON, b, length_km=75 if mode=="outgoing" else 65)
+        folium.PolyLine(ray, weight=5, opacity=0.7, color=color, tooltip=name, popup=pop,
+                        dash_array="8 6" if mode=="outgoing" else None).add_to(layer)
+
+# Incoming / Outgoing layers
 for _, r in incoming_df.iterrows():
-    b = get_bearing(r)
-    if b is None: continue
-    ray = direction_ray(BERBERA_LAT, BERBERA_LON, b, length_km=70)
-    name = r.get("name","")
-    lp   = r.get("last_port_detailed") or r.get("last_port") or ""
-    dest = r.get("destination") or "Berbera"
-    popup = f"<b>{name}</b><br>From: {lp}<br>To: {dest}<br>Bearing: {round(b)}°"
-    folium.PolyLine(ray, weight=5, opacity=0.7, color="#2ca02c", tooltip=name, popup=popup).add_to(fg_in)
+    add_ship_segment_or_ray(r, fg_in, mode="incoming")
 
-# Outgoing rays
 for _, r in outgoing_df.iterrows():
-    b = get_bearing(r)
-    if b is None: continue
-    ray = direction_ray(BERBERA_LAT, BERBERA_LON, b, length_km=80)
-    name = r.get("name","")
-    dest = r.get("destination") or ""
-    popup = f"<b>{name}</b><br>To: {dest}<br>Bearing: {round(b)}°"
-    folium.PolyLine(ray, weight=5, opacity=0.7, color="#d62728", tooltip=name, popup=popup, dash_array="8 6").add_to(fg_out)
+    add_ship_segment_or_ray(r, fg_out, mode="outgoing")
 
-fg_in.add_to(m); fg_out.add_to(m)
+# In-port markers (even without bearings)
+for _, r in inport_df.iterrows():
+    name = r.get("name","")
+    lat  = r.get("lat_deg")
+    lon  = r.get("lon_deg")
+    if pd.notna(lat) and pd.notna(lon):
+        pop = f"<b>{name}</b><br>Status: In Port"
+        folium.CircleMarker(location=(lat, lon), radius=6, tooltip=name, popup=pop,
+                            color="#1f77b4", fill=True).add_to(fg_berth)
+
+fg_in.add_to(m); fg_out.add_to(m); fg_berth.add_to(m)
 MiniMap(toggle_display=True, minimized=True).add_to(m)
 folium.LayerControl(collapsed=True).add_to(m)
 
-st.components.v1.html(m._repr_html_(), height=520, scrolling=False)
-st.caption("Note: Rays are schematic and anchored at the port; bearings from Course° (or cardinal).")
+st.components.v1.html(m._repr_html_(), height=540, scrolling=False)
+
+# Basic debug counts (helps when map looks empty)
+st.caption(f"Map data — incoming: {len(incoming_df)}, outgoing: {len(outgoing_df)}, in_port: {len(inport_df)}")
 
 st.markdown("---")
 
 # =========================
-# Historical In-Port Browser (snapshots)
+# Historical In-Port Browser (tug-free snapshots)
 # =========================
 st.subheader("Historical In-Port Browser (tug-free snapshots)")
 df_in_hist = df_all[(df_all["status"]=="in_port") & df_all["scraped_at_utc"].notna()].copy()
@@ -459,12 +492,18 @@ else:
     df_in_hist["scraped_floor"] = pd.to_datetime(df_in_hist["scraped_at_utc"], utc=True, errors="coerce").dt.floor("s")
     unique_times = sorted(df_in_hist["scraped_floor"].unique())
     chosen_ts = st.selectbox("Snapshot time (UTC)", unique_times, index=len(unique_times)-1)
-    snap = df_in_hist[df_in_hist["scraped_floor"] == chosen_ts]
-    st.caption(f"In port @ {chosen_ts} — {snap['mmsi'].nunique()} vessels | {snap['teu_equiv'].sum():,.0f} TEU-equiv")
-    st.dataframe(snap[
-        ["name","mmsi","ship_type","status","route_last_port","destination","gt","dwt","length_m","beam_m","teu_equiv","scraped_at_utc"]],
-        use_container_width=True, hide_index=True
-    )
+    snap = df_in_hist[df_in_hist["scraped_floor"] == chosen_ts].copy()
+
+    # derive optional route_last_port if not present
+    if "route_last_port" not in snap.columns:
+        snap["route_last_port"] = snap["last_port_detailed"].fillna(snap["last_port"])
+
+    want_cols = [
+        "name","mmsi","ship_type","status","route_last_port","destination",
+        "gt","dwt","length_m","beam_m","teu_equiv","scraped_at_utc"
+    ]
+    st.caption(f"In port @ {chosen_ts} — {snap['mmsi'].nunique()} vessels | {pd.to_numeric(snap['teu_equiv'], errors='coerce').fillna(0).sum():,.0f} TEU-equiv")
+    st.dataframe(snap[safe_cols(snap, want_cols)], use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
@@ -556,7 +595,7 @@ else:
     else:
         fig_rose = px.bar_polar(rose, r="count", theta="sector", direction="clockwise", start_angle=90,
                                 title="Direction Wind-Rose (arrivals + in-port)")
-        st.plotly_chart(fig, use_container_width=True) if False else st.plotly_chart(fig_rose, use_container_width=True)
+        st.plotly_chart(fig_rose, use_container_width=True)
 
 # =========================
 # Methodology
@@ -564,19 +603,12 @@ else:
 with st.expander("ℹ️ Methodology"):
     st.markdown(f"""
 **Directional Map**
-- Schematic rays anchored at the port show approach/egress sectors using Course° (or cardinal).
-- When we add live lat/lon, we can draw true polylines to/from the port.
-
-**Wind-Rose**
-- Bearings are binned into 8 sectors (N, NE, E, …) for chosen time windows.
+- Real segments drawn when vessel coordinates are available from detail pages.
+- Fallback: schematic rays using Course° (or cardinal) from detail pages.
 
 **Port-calls**
-- Arrival = first time `status == "in_port"` after being away.
-- Departure = first non-`in_port` after arrival (active if none yet).
-- Call TEU = max TEU observed while in_port.
-- Weekly/Monthly TEU = sum of call TEU where **arrival** falls in the period (counted once).
+- Count each call once on arrival; dwell until first non-in_port status.
 
 **Targets & SLA**
-- Annual target = {ANNUAL_TEU_TARGET:,.0f} TEU; daily/weekly/monthly derived.
-- SLA threshold = {SLA_HOURS:.0f} hours dwell.
+- Annual target = {ANNUAL_TEU_TARGET:,.0f} TEU; SLA = {SLA_HOURS:.0f} h dwell.
 """)
