@@ -1,11 +1,11 @@
 # scripts/s3_pipeline_shipfinder_berbera.py
 """
-Berbera Port Monitor — VesselFinder → S3 pipeline (detail-page enrichment)
-- Scrapes main page tables (and iframes) and extracts per-row anchor links.
-- Visits detail pages for priority statuses (in_port, incoming, expected, outgoing).
-- Extracts destination, last_port_detailed, ATD, course, speed, nav status,
-  position age, draught, flag/IMO/callsign, and lat/lon when exposed.
-- Writes latest + history + in_port history (tug-free).
+Berbera Port Monitor — VesselFinder → S3 pipeline (with detail-page enrichment)
+Fixes/Improvements:
+- Robust anchor → detail_url mapping by name
+- Add lat/lon extraction (several patterns)
+- Priority: in_port > incoming > expected > outgoing
+- Higher default MAX_DETAIL_VESSELS (40)
 """
 
 import os
@@ -30,7 +30,7 @@ S3_BUCKET  = get_env("S3_BUCKET")
 S3_PREFIX  = (get_env("S3_PREFIX") or "berbera").strip().strip("/")
 AWS_REGION = get_env("AWS_REGION") or None
 VF_URL     = get_env("VF_URL") or "https://www.vesselfinder.com/ports/SOBBO001"
-MAX_DETAIL_VESSELS = int(get_env("MAX_DETAIL_VESSELS", "40"))  # ← larger default
+MAX_DETAIL_VESSELS = int(get_env("MAX_DETAIL_VESSELS", "40"))  # polite cap per run
 
 if not S3_BUCKET:
     raise SystemExit("❌ S3_BUCKET is required.")
@@ -204,7 +204,6 @@ def html_table_to_df(table_html: str) -> pd.DataFrame:
     if table is None:
         return pd.DataFrame()
 
-    # headers
     headers = []
     thead = table.find("thead")
     if thead:
@@ -215,9 +214,9 @@ def html_table_to_df(table_html: str) -> pd.DataFrame:
         if first_tr:
             headers = [td.get_text(strip=True) for td in first_tr.find_all(["th","td"])]
 
-    # rows (skip header row if it mirrors headers)
     rows = []
-    for tr in table.find_all("tr"):
+    body_trs = table.find_all("tr")
+    for tr in body_trs:
         tds = tr.find_all(["td","th"])
         if not tds:
             continue
@@ -233,28 +232,6 @@ def html_table_to_df(table_html: str) -> pd.DataFrame:
 
     df = pd.DataFrame(norm_rows, columns=headers)
     df = df.replace("", pd.NA).dropna(how="all")
-
-    # attach row-level anchor HREFs aligned to df order
-    # (find tbody rows if present; else all data rows minus header)
-    hrefs: List[Optional[str]] = []
-    body_rows = table.find("tbody").find_all("tr") if table.find("tbody") else table.find_all("tr")
-    # If first row equals headers, skip it
-    if body_rows and headers and [td.get_text(strip=True).lower() for td in body_rows[0].find_all(["td","th"])] == [h.lower() for h in headers]:
-        body_rows = body_rows[1:]
-    # name column index
-    try:
-        name_idx = list(df.columns).index(pick_col(list(df.columns), NAME_PATTERNS) or df.columns[0])
-    except Exception:
-        name_idx = 0
-    for tr in body_rows[:len(df)]:
-        cells = tr.find_all(["td","th"])
-        href = None
-        if name_idx < len(cells):
-            a = cells[name_idx].find("a", href=True)
-            if a and a.get("href"):
-                href = a["href"]
-        hrefs.append(href)
-    df["__detail_href"] = pd.Series(hrefs[:len(df)])
     return df
 
 def split_name_and_type(raw: str) -> Tuple[str, Optional[str]]:
@@ -280,10 +257,8 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
         return pd.DataFrame(columns=APP_COLS)
 
     if save_csv_to:
-        try:
-            df.to_csv(save_csv_to, index=False)
-        except Exception:
-            pass
+        try: df.to_csv(save_csv_to, index=False)
+        except Exception: pass
 
     cols = df.columns.tolist()
     name_col  = pick_col(cols, NAME_PATTERNS) or (cols[0] if cols else None)
@@ -300,15 +275,44 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
 
     out: Dict[str, pd.Series] = {}
 
-    # Name + detail_url (from __detail_href)
-    out["name"] = df[name_col].astype(str).str.strip() if name_col else pd.Series([None]*len(df))
-    base = "https://www.vesselfinder.com"
-    if "__detail_href" in df.columns:
-        urls = df["__detail_href"].fillna("").astype(str)
-        urls = urls.map(lambda u: base + u if u and u.startswith("/") else (u if u.startswith("http") else None))
-        out["detail_url"] = urls
+    # Name & detail_url mapping by anchor text
+    if name_col:
+        out["name"] = df[name_col].astype(str).str.strip()
+        # Build name -> href map from the raw HTML (align by name text)
+        soup = BeautifulSoup(table_html, "html.parser")
+        name_to_href: Dict[str, Optional[str]] = {}
+        for row in soup.find_all("tr"):
+            cells = row.find_all(["td","th"])
+            if not cells: continue
+            # try first cell; else search for any anchor
+            target = None
+            if len(cells) >= 1:
+                a = cells[0].find("a", href=True)
+                if a:
+                    target = (a.get_text(strip=True), a["href"])
+            if not target:
+                a = row.find("a", href=True)
+                if a:
+                    target = (a.get_text(strip=True), a["href"])
+            if target:
+                tname = target[0].strip()
+                href = target[1]
+                if tname and tname not in name_to_href:
+                    name_to_href[tname] = href
+        # map by exact name text; fallback None
+        out["detail_url"] = out["name"].map(lambda n: name_to_href.get(str(n).strip()))
     else:
+        out["name"] = pd.Series([None]*len(df))
         out["detail_url"] = pd.Series([None]*len(df))
+
+    # Normalize detail_url to absolute
+    base = "https://www.vesselfinder.com"
+    out["detail_url"] = out["detail_url"].astype(object)
+    if out["detail_url"].notna().any():
+        s = out["detail_url"].astype(str)
+        mask_rel = s.str.startswith("/")
+        s.loc[mask_rel] = base + s.loc[mask_rel]
+        out["detail_url"] = s
 
     # MMSI
     if mmsi_col:
@@ -317,10 +321,7 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
         out["mmsi"] = pd.NA
 
     # Ship type
-    if type_col:
-        out["ship_type"] = df[type_col].astype(str).str.strip().str.title()
-    else:
-        out["ship_type"] = "Unknown"
+    out["ship_type"] = (df[type_col].astype(str).str.strip().str.title() if type_col else pd.Series(["Unknown"]*len(df)))
 
     # Ports
     if from_col:
@@ -331,10 +332,7 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
         out["last_port"] = pd.NA
 
     # ETA
-    if eta_col:
-        out["eta_to_berbera_utc"] = coerce_eta(df[eta_col])
-    else:
-        out["eta_to_berbera_utc"] = pd.NA
+    out["eta_to_berbera_utc"] = (coerce_eta(df[eta_col]) if eta_col else pd.NA)
 
     # Speed
     if speed_col:
@@ -350,15 +348,12 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
     out["dwt"] = _num(df[dwt_col]) if dwt_col else pd.NA
 
     # Size (Length / Beam)
-    length_m = pd.Series([pd.NA]*len(df))
-    beam_m   = pd.Series([pd.NA]*len(df))
+    length_m = pd.Series([pd.NA]*len(df)); beam_m = pd.Series([pd.NA]*len(df))
     if size_col:
         for i, txt in enumerate(df[size_col].astype(str)):
             L, B = parse_size_len_beam(txt)
-            length_m.iloc[i] = L
-            beam_m.iloc[i]   = B
-    out["length_m"] = length_m
-    out["beam_m"]   = beam_m
+            length_m.iloc[i] = L; beam_m.iloc[i]   = B
+    out["length_m"] = length_m; out["beam_m"] = beam_m
 
     # Built
     out["built_year"] = _num(df[built_col]) if built_col else pd.NA
@@ -372,7 +367,7 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
 
     out_df = pd.DataFrame(out)
 
-    # If ship_type unknown but embedded in name, split it
+    # Type embedded in name → split
     mask_unknown = out_df["ship_type"].isna() | (out_df["ship_type"] == "") | (out_df["ship_type"] == "Unknown")
     if mask_unknown.any():
         new_names, inferred_types = [], []
@@ -415,13 +410,12 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
     return out_df
 
 # =========================
-# Playwright: tables + enrichment pages
+# Playwright: capture tables and enrichment pages
 # =========================
 def try_click_cookies(page):
     selectors = [
         "button:has-text('Accept')","button:has-text('I Agree')","button:has-text('Agree')",
-        "text=Accept all","text=Accept All",
-        "[id*='accept']","[class*='accept']","[aria-label*='accept']",
+        "text=Accept all","text=Accept All","[id*='accept']","[class*='accept']","[aria-label*='accept']",
     ]
     for sel in selectors:
         try:
@@ -599,9 +593,8 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
     callsign = rex(r"Callsign\s*([A-Za-z0-9\-]+)")
     mmsi     = rex(r"IMO\s*/\s*MMSI\s*[0-9]{7,9}\s*/\s*([0-9]{6,10})")
 
-    # Coordinates (multiple strategies)
-    lat_deg = None
-    lon_deg = None
+    # Coordinates — multiple patterns
+    lat_deg = None; lon_deg = None
 
     cand = soup.find(attrs={"data-lat": True, "data-lon": True}) or soup.find(attrs={"data-latitude": True, "data-longitude": True})
     if cand:
@@ -647,15 +640,19 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
         "lon_deg": lon_deg,
     }
 
-def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 12, per_page_timeout_ms: int = 12000) -> pd.DataFrame:
+def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 40, per_page_timeout_ms: int = 15000) -> pd.DataFrame:
     if df.empty or "detail_url" not in df.columns:
         return df
 
-    # Prioritize statuses we care about the most
-    prio = ["in_port","incoming","expected","outgoing"]
+    # Priority: in_port > incoming > expected > outgoing
+    prio_order = {"in_port":0, "incoming":1, "expected":2, "outgoing":3}
     dfc = df.copy()
-    dfc["__prio"] = dfc["status"].apply(lambda s: prio.index(s) if s in prio else 99)
-    targets = dfc.dropna(subset=["detail_url"]).sort_values(["__prio","name"]).head(max_n)
+    dfc["__prio"] = dfc["status"].map(lambda s: prio_order.get(str(s).lower(), 99))
+    targets = (dfc.dropna(subset=["detail_url"])
+                 .sort_values(["__prio","name"])
+                 .groupby("mmsi", as_index=False)
+                 .first()
+                 .head(max_n))
 
     if targets.empty:
         return df
@@ -677,7 +674,7 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 12, per_page_timeout
                 continue
             try:
                 page.goto(url, wait_until="domcontentloaded")
-                page.wait_for_timeout(600)  # settle
+                page.wait_for_timeout(600)
                 html = page.content()
                 info = parse_detail_textual(html)
                 out_rows.append(dict(
@@ -699,7 +696,8 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 12, per_page_timeout
                     lon_deg=info["lon_deg"],
                 ))
                 page.wait_for_timeout(250)
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ detail: {url} — {e}")
                 continue
 
         context.close()
@@ -712,14 +710,15 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 12, per_page_timeout
     merged = df.merge(extra, on=["mmsi"], how="left", suffixes=("","_det"))
 
     # Prefer detail fields where present
-    for col in ["detail_url","destination","last_port_detailed","atd_last_port_utc","course_deg","heading_deg",
-                "nav_status","direction_cardinal","position_age_min","draught_m","flag","imo","callsign",
-                "lat_deg","lon_deg"]:
+    prefer = ["destination","last_port_detailed","atd_last_port_utc","course_deg","heading_deg",
+              "nav_status","direction_cardinal","position_age_min","draught_m","flag","imo","callsign","detail_url",
+              "lat_deg","lon_deg"]
+    for col in prefer:
         det = f"{col}_det"
         if det in merged.columns:
             merged[col] = merged[det].combine_first(merged[col])
 
-    drop_cols = [c for c in merged.columns if c.endswith("_det")] + ["__prio"]
+    drop_cols = [c for c in merged.columns if c.endswith("_det")]
     merged = merged.drop(columns=drop_cols, errors="ignore")
     return merged
 
