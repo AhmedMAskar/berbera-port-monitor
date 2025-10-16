@@ -1,7 +1,19 @@
-psycopg2-binary==2.9.9
-pandas==2.*
-boto3==1.*
-requests==2.*
-playwright==1.*           # for headless browser
-beautifulsoup4==4.*       # pandas.read_html helper
-lxml==5.*                 # pandas.read_html helper
+# Core
+pandas>=2.2
+numpy>=1.26
+
+# App
+streamlit>=1.38
+plotly>=5.22
+folium>=0.17
+
+# Scraping
+playwright>=1.47
+beautifulsoup4>=4.12
+lxml>=5.2
+
+# AWS / IO
+boto3>=1.34
+
+# Misc
+python-dateutil>=2.9
