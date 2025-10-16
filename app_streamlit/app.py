@@ -1,10 +1,11 @@
 # app_streamlit/app.py
 # ------------------------------------------------------------
-# Berbera Port Monitor — TEU (Port-Calls · Enrichment · Map)
+# Berbera Port Monitor — TEU (Calls · Enrichment · Map)
 # ------------------------------------------------------------
-# - Robust against missing optional columns in history snapshots
-# - Shows real polylines when lat/lon exist, else schematic rays
-# - Marks in_port ships even without bearings
+# Fixes:
+# - KeyError in Historical In-Port Browser (safe columns + derived cols)
+# - Robust direction/map drawing (fallbacks for missing fields)
+# - Safe KPIs and tables even if some columns missing
 # ------------------------------------------------------------
 
 import os
@@ -131,12 +132,9 @@ def load_vf_history_from_s3(cache_bust: str, limit_keys: int = 800) -> pd.DataFr
 # Data prep
 # =========================
 def coerce_timestamps(df: pd.DataFrame) -> pd.DataFrame:
-    if "scraped_at_utc" in df.columns:
-        df["scraped_at_utc"] = pd.to_datetime(df["scraped_at_utc"], errors="coerce", utc=True)
-    if "eta_to_berbera_utc" in df.columns:
-        df["eta_to_berbera_utc"] = pd.to_datetime(df["eta_to_berbera_utc"], errors="coerce", utc=True)
-    if "atd_last_port_utc" in df.columns:
-        df["atd_last_port_utc"] = pd.to_datetime(df["atd_last_port_utc"], errors="coerce", utc=True)
+    for c in ["scraped_at_utc", "eta_to_berbera_utc", "atd_last_port_utc"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce", utc=True)
     return df
 
 def unify_schema(df: pd.DataFrame) -> pd.DataFrame:
@@ -145,10 +143,11 @@ def unify_schema(df: pd.DataFrame) -> pd.DataFrame:
         "distance_nm_to_berbera","eta_to_berbera_utc","speed_kn",
         "gt","dwt","length_m","beam_m","built_year",
         "teu_capacity_actual","teu_equiv","source",
-        # enrichment fields (may or may not be present in older history)
+        # enrichment fields
         "detail_url","destination","last_port_detailed","atd_last_port_utc",
         "course_deg","heading_deg","nav_status","direction_cardinal",
-        "position_age_min","flag","imo","callsign","lat_deg","lon_deg",
+        "position_age_min","flag","imo","callsign","draught_m",
+        "lat_deg","lon_deg",
     ]
     for c in needed:
         if c not in df.columns:
@@ -156,9 +155,10 @@ def unify_schema(df: pd.DataFrame) -> pd.DataFrame:
     df["status"] = df["status"].astype(str).str.strip().str.lower()
     df["ship_type"] = df["ship_type"].astype(str).str.strip().str.title()
     df = coerce_timestamps(df)
-    for c in ["distance_nm_to_berbera","speed_kn","gt","dwt","length_m","beam_m","built_year",
-              "teu_equiv","teu_capacity_actual","course_deg","heading_deg",
-              "position_age_min","lat_deg","lon_deg"]:
+    num_cols = ["distance_nm_to_berbera","speed_kn","gt","dwt","length_m","beam_m","built_year",
+                "teu_equiv","teu_capacity_actual","course_deg","heading_deg","position_age_min",
+                "draught_m","lat_deg","lon_deg"]
+    for c in num_cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
@@ -207,6 +207,28 @@ def ensure_teu_equiv(df: pd.DataFrame) -> pd.DataFrame:
         df.loc[mask_missing, "teu_equiv"] = vals
     return df
 
+def add_derived_fields(df: pd.DataFrame) -> pd.DataFrame:
+    """Add route_last_port + derived direction_cardinal if missing."""
+    df = df.copy()
+    if "route_last_port" not in df.columns:
+        df["route_last_port"] = df.get("last_port_detailed") if "last_port_detailed" in df.columns else None
+        if "route_last_port" in df.columns and "last_port" in df.columns:
+            df["route_last_port"] = df["route_last_port"].fillna(df["last_port"])
+    # derive cardinal from course if missing
+    if "direction_cardinal" in df.columns and "course_deg" in df.columns:
+        card = df["direction_cardinal"].astype(object)
+        missing = card.isna() | (card.astype(str) == "") | (card.astype(str).str.lower() == "none")
+        def to_card(deg):
+            if pd.isna(deg): return None
+            dirs = ["N","NE","E","SE","S","SW","W","NW"]
+            return dirs[int(((float(deg) % 360) + 22.5)//45) % 8]
+        card.loc[missing] = df.loc[missing, "course_deg"].map(to_card)
+        df["direction_cardinal"] = card
+    return df
+
+def cols_present(df: pd.DataFrame, desired: List[str]) -> List[str]:
+    return [c for c in desired if c in df.columns]
+
 # =========================
 # Load data
 # =========================
@@ -227,19 +249,7 @@ df_all = unify_schema(df_all).drop_duplicates(subset=["mmsi","scraped_at_utc"], 
 df_all = add_time_bins(df_all)
 df_all = _exclude_tugs(df_all)
 df_all = ensure_teu_equiv(df_all)
-
-# =========================
-# Helpers
-# =========================
-def safe_cols(df: pd.DataFrame, wanted: list[str]) -> list[str]:
-    return [c for c in wanted if c in df.columns]
-
-def compute_latest_rows() -> pd.DataFrame:
-    if not vf_latest.empty:
-        df = unify_schema(vf_latest.copy()); df = _exclude_tugs(df); df = ensure_teu_equiv(df); return df
-    if not df_all.empty:
-        max_ts = df_all["scraped_at_utc"].max(); return df_all[df_all["scraped_at_utc"] == max_ts]
-    return pd.DataFrame()
+df_all = add_derived_fields(df_all)
 
 # =========================
 # Port-call detection + SLA
@@ -247,10 +257,8 @@ def compute_latest_rows() -> pd.DataFrame:
 @st.cache_data(ttl=0)
 def build_port_calls(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
-        return pd.DataFrame(columns=[
-            "mmsi","name","ship_type","arrived_at","departed_at","dwell_hours",
-            "call_teu","last_port","last_port_detailed"
-        ])
+        cols = ["mmsi","name","ship_type","arrived_at","departed_at","dwell_hours","call_teu","last_port","last_port_detailed"]
+        return pd.DataFrame(columns=cols)
     dfx = df.sort_values(["mmsi","scraped_at_utc"]).reset_index(drop=True)
     rows = []
     now = pd.Timestamp.now(tz="UTC")
@@ -263,9 +271,10 @@ def build_port_calls(df: pd.DataFrame) -> pd.DataFrame:
             ts = r["scraped_at_utc"]; status = (r["status"] or "").lower()
             teu = float(r.get("teu_equiv") or 0.0); lp  = r.get("last_port"); lpd = r.get("last_port_detailed")
             if (not in_call) and status == "in_port":
-                in_call, call_start = True, ts; call_teus=[teu]
-                if pd.notna(lp):  lps.append(lp)
-                if pd.notna(lpd): lpds.append(lpd)
+                in_call, call_start = True, ts
+                if pd.notna(teu): call_teus=[teu]
+                if pd.notna(lp):  lps=[lp]
+                if pd.notna(lpd): lpds=[lpd]
                 continue
             if in_call and status == "in_port":
                 if pd.notna(teu): call_teus.append(teu)
@@ -335,6 +344,13 @@ def kpi_values(latest_df: pd.DataFrame, calls_df: pd.DataFrame) -> dict:
     return dict(in_port_teu=in_port_teu,daily_pct=daily_pct,weekly_teu=weekly_teu,weekly_pct=weekly_pct,
                 monthly_teu=monthly_teu,monthly_pct=monthly_pct)
 
+def compute_latest_rows() -> pd.DataFrame:
+    if not vf_latest.empty:
+        df = unify_schema(vf_latest.copy()); df = _exclude_tugs(df); df = ensure_teu_equiv(df); df = add_derived_fields(df); return df
+    if not df_all.empty:
+        max_ts = df_all["scraped_at_utc"].max(); return add_derived_fields(df_all[df_all["scraped_at_utc"] == max_ts])
+    return pd.DataFrame()
+
 latest_rows = compute_latest_rows()
 k = kpi_values(latest_rows, port_calls)
 
@@ -352,7 +368,7 @@ st.caption(f"Data freshness: {fresh_ts.isoformat() if fresh_ts is not None else 
 st.markdown("---")
 
 # =========================
-# Current status (enriched)
+# Current status (enriched prefs)
 # =========================
 statuses_present = sorted(set(x for x in df_all["status"].dropna().unique() if x in KNOWN_STATUSES)) or KNOWN_STATUSES
 status = st.selectbox("View", statuses_present, index=0)
@@ -364,17 +380,15 @@ if not latest_df.empty:
     if status: latest_df = latest_df[latest_df["status"] == status]
     if selected_types: latest_df = latest_df[latest_df["ship_type"].isin(selected_types)]
 
-latest_df["route_last_port"] = latest_df["last_port_detailed"].fillna(latest_df["last_port"])
-latest_df["dir"] = latest_df["direction_cardinal"].fillna("")
-
 cols_latest = [
-    "name","mmsi","ship_type","status","route_last_port","destination","dir",
+    "name","mmsi","ship_type","status","route_last_port","destination","direction_cardinal",
     "gt","dwt","length_m","beam_m","teu_equiv","eta_to_berbera_utc",
-    "speed_kn","course_deg","lat_deg","lon_deg","scraped_at_utc","detail_url"
+    "speed_kn","course_deg","scraped_at_utc","detail_url","lat_deg","lon_deg"
 ]
 st.subheader(f"Latest — {status} (tug-free, enriched)")
-st.dataframe(latest_df[safe_cols(latest_df, cols_latest)], use_container_width=True, hide_index=True)
-st.download_button("⬇️ Download CSV", latest_df[safe_cols(latest_df, cols_latest)].to_csv(index=False).encode("utf-8"),
+st.dataframe(latest_df[cols_present(latest_df, cols_latest)], use_container_width=True, hide_index=True)
+st.download_button("⬇️ Download CSV",
+                   latest_df[cols_present(latest_df, cols_latest)].to_csv(index=False).encode("utf-8"),
                    file_name=f"{status}_latest_teu.csv", mime="text/csv")
 
 st.markdown("---")
@@ -382,7 +396,7 @@ st.markdown("---")
 # =========================
 # Directional Map — Berbera vicinity
 # =========================
-st.subheader("Map — Berbera & Vicinity (Real Segments when possible)")
+st.subheader("Map — Berbera & Vicinity (True segments if lat/lon; else rays)")
 
 def bearing_from_cardinal(card: str) -> Optional[float]:
     m = {"N":0,"NE":45,"E":90,"SE":135,"S":180,"SW":225,"W":270,"NW":315}
@@ -402,17 +416,19 @@ def direction_ray(lat0, lon0, bearing_deg, length_km=60):
 
 incoming_df = latest_rows[(latest_rows["status"]=="incoming")].copy()
 outgoing_df = latest_rows[(latest_rows["status"]=="outgoing")].copy()
-inport_df   = latest_rows[(latest_rows["status"]=="in_port")].copy()
+inport_df   = latest_rows[(latest_rows["status"]=="in_port")].copy()  # optional: show short stubs
 
 def get_bearing(row):
-    if pd.notna(row.get("course_deg")):
-        return float(row["course_deg"])
-    card = row.get("direction_cardinal")
-    b = bearing_from_cardinal(card) if pd.notna(card) else None
-    return b
+    if "course_deg" in row and pd.notna(row["course_deg"]):
+        try: return float(row["course_deg"])
+        except Exception: pass
+    if "direction_cardinal" in row and pd.notna(row["direction_cardinal"]):
+        return bearing_from_cardinal(row["direction_cardinal"])
+    return None
 
 m = folium.Map(location=[BERBERA_LAT, BERBERA_LON], tiles="OpenStreetMap", zoom_start=10, control_scale=True)
 
+# Port marker
 folium.Marker([BERBERA_LAT, BERBERA_LON],
               tooltip="Berbera Port",
               popup="Berbera Port",
@@ -420,16 +436,16 @@ folium.Marker([BERBERA_LAT, BERBERA_LON],
 
 fg_in  = FeatureGroup(name="Incoming", show=True)
 fg_out = FeatureGroup(name="Outgoing", show=True)
-fg_berth = FeatureGroup(name="In-Port markers", show=True)
+fg_berth = FeatureGroup(name="In-Port (berth)", show=True)
 
 def add_ship_segment_or_ray(row, layer, mode: str):
     """
-    mode = 'incoming' or 'outgoing'
-    If row has lat_deg/lon_deg, draw a real segment; else fallback to schematic ray.
+    mode = 'incoming' or 'outgoing' or 'in_port'
+    Draw a real segment if lat/lon exist; otherwise draw a short ray from port using bearing (if any).
     """
     name = row.get("name","")
-    lp   = row.get("last_port_detailed") or row.get("last_port") or ""
-    dest = row.get("destination") or ("Berbera" if mode=="incoming" else "")
+    lp   = row.get("route_last_port") or row.get("last_port_detailed") or row.get("last_port") or ""
+    dest = row.get("destination") or ("Berbera" if mode in ("incoming","in_port") else "")
     b    = get_bearing(row)
     lat  = row.get("lat_deg")
     lon  = row.get("lon_deg")
@@ -437,73 +453,67 @@ def add_ship_segment_or_ray(row, layer, mode: str):
     if mode == "incoming":
         pop = f"<b>{name}</b><br>From: {lp}<br>To: {dest}{('<br>Bearing: %d°'%round(b)) if b is not None else ''}"
         color = "#2ca02c"
-    else:
+    elif mode == "outgoing":
         pop = f"<b>{name}</b><br>To: {dest}{('<br>Bearing: %d°'%round(b)) if b is not None else ''}"
         color = "#d62728"
+    else:
+        pop = f"<b>{name}</b><br>Status: In port"
+        color = "#9467bd"
 
-    if pd.notna(lat) and pd.notna(lon):
-        pts = ([(lat, lon), (BERBERA_LAT, BERBERA_LON)] if mode=="incoming"
-               else [(BERBERA_LAT, BERBERA_LON), (lat, lon)])
-        folium.PolyLine(pts, weight=5, opacity=0.8, color=color, tooltip=name, popup=pop).add_to(layer)
+    try_lat = pd.notna(lat)
+    try_lon = pd.notna(lon)
+
+    if try_lat and try_lon:
+        if mode == "incoming":
+            pts = [(lat, lon), (BERBERA_LAT, BERBERA_LON)]
+        elif mode == "outgoing":
+            pts = [(BERBERA_LAT, BERBERA_LON), (lat, lon)]
+        else:
+            pts = [(lat, lon), (BERBERA_LAT, BERBERA_LON)]  # berth stub
+        folium.PolyLine(pts, weight=5, opacity=0.85, color=color, tooltip=name, popup=pop).add_to(layer)
         folium.CircleMarker(location=(lat, lon), radius=5, tooltip=name, popup=pop, color=color, fill=True).add_to(layer)
     else:
         if b is None:
+            # still mark the berth ship on the port
+            if mode == "in_port":
+                folium.CircleMarker(location=(BERBERA_LAT, BERBERA_LON), radius=4, tooltip=name, popup=pop, color=color, fill=True).add_to(layer)
             return
         ray = direction_ray(BERBERA_LAT, BERBERA_LON, b, length_km=75 if mode=="outgoing" else 65)
         folium.PolyLine(ray, weight=5, opacity=0.7, color=color, tooltip=name, popup=pop,
                         dash_array="8 6" if mode=="outgoing" else None).add_to(layer)
 
-# Incoming / Outgoing layers
 for _, r in incoming_df.iterrows():
     add_ship_segment_or_ray(r, fg_in, mode="incoming")
-
 for _, r in outgoing_df.iterrows():
     add_ship_segment_or_ray(r, fg_out, mode="outgoing")
-
-# In-port markers (even without bearings)
 for _, r in inport_df.iterrows():
-    name = r.get("name","")
-    lat  = r.get("lat_deg")
-    lon  = r.get("lon_deg")
-    if pd.notna(lat) and pd.notna(lon):
-        pop = f"<b>{name}</b><br>Status: In Port"
-        folium.CircleMarker(location=(lat, lon), radius=6, tooltip=name, popup=pop,
-                            color="#1f77b4", fill=True).add_to(fg_berth)
+    add_ship_segment_or_ray(r, fg_berth, mode="in_port")
 
 fg_in.add_to(m); fg_out.add_to(m); fg_berth.add_to(m)
 MiniMap(toggle_display=True, minimized=True).add_to(m)
 folium.LayerControl(collapsed=True).add_to(m)
 
 st.components.v1.html(m._repr_html_(), height=540, scrolling=False)
-
-# Basic debug counts (helps when map looks empty)
-st.caption(f"Map data — incoming: {len(incoming_df)}, outgoing: {len(outgoing_df)}, in_port: {len(inport_df)}")
+st.caption("Segments use live lat/lon when available; otherwise bearings draw schematic rays anchored at the port.")
 
 st.markdown("---")
 
 # =========================
-# Historical In-Port Browser (tug-free snapshots)
+# Historical In-Port Browser (snapshots) — SAFE COLS
 # =========================
 st.subheader("Historical In-Port Browser (tug-free snapshots)")
 df_in_hist = df_all[(df_all["status"]=="in_port") & df_all["scraped_at_utc"].notna()].copy()
 if df_in_hist.empty:
     st.info("No in-port history yet.")
 else:
+    df_in_hist = add_derived_fields(df_in_hist)
     df_in_hist["scraped_floor"] = pd.to_datetime(df_in_hist["scraped_at_utc"], utc=True, errors="coerce").dt.floor("s")
-    unique_times = sorted(df_in_hist["scraped_floor"].unique())
+    unique_times = sorted(df_in_hist["scraped_floor"].dropna().unique())
     chosen_ts = st.selectbox("Snapshot time (UTC)", unique_times, index=len(unique_times)-1)
     snap = df_in_hist[df_in_hist["scraped_floor"] == chosen_ts].copy()
-
-    # derive optional route_last_port if not present
-    if "route_last_port" not in snap.columns:
-        snap["route_last_port"] = snap["last_port_detailed"].fillna(snap["last_port"])
-
-    want_cols = [
-        "name","mmsi","ship_type","status","route_last_port","destination",
-        "gt","dwt","length_m","beam_m","teu_equiv","scraped_at_utc"
-    ]
-    st.caption(f"In port @ {chosen_ts} — {snap['mmsi'].nunique()} vessels | {pd.to_numeric(snap['teu_equiv'], errors='coerce').fillna(0).sum():,.0f} TEU-equiv")
-    st.dataframe(snap[safe_cols(snap, want_cols)], use_container_width=True, hide_index=True)
+    st.caption(f"In port @ {chosen_ts} — {snap['mmsi'].nunique()} vessels | {pd.to_numeric(snap.get('teu_equiv', pd.Series(dtype=float)), errors='coerce').fillna(0).sum():,.0f} TEU-equiv")
+    cols_hist = ["name","mmsi","ship_type","status","route_last_port","destination","gt","dwt","length_m","beam_m","teu_equiv","scraped_at_utc"]
+    st.dataframe(snap[cols_present(snap, cols_hist)], use_container_width=True, hide_index=True)
 
 st.markdown("---")
 
@@ -511,12 +521,10 @@ st.markdown("---")
 # Port-Call Analytics
 # =========================
 st.subheader("Port Calls (arrival-based, counted once)")
-
 if (pc := port_calls).empty:
     st.info("No detected port calls yet.")
 else:
     pc["route_last_port"] = pc["last_port_detailed"].fillna(pc["last_port"])
-
     st.markdown("### Currently Berthed (live dwell)")
     active = pc[pc["departed_at"].isna()].copy()
     if active.empty:
@@ -524,7 +532,7 @@ else:
     else:
         active["dwell_hours"] = active["dwell_hours"].round(1)
         st.dataframe(
-            active[["name","mmsi","ship_type","route_last_port","arrived_at","dwell_hours","call_teu","sla_label"]],
+            active[cols_present(active, ["name","mmsi","ship_type","route_last_port","arrived_at","dwell_hours","call_teu","sla_label"])],
             use_container_width=True, hide_index=True
         )
 
@@ -542,13 +550,13 @@ else:
         with cA:
             st.caption("Fastest unloads (shortest dwell)")
             st.dataframe(
-                fastest[["name","mmsi","ship_type","route_last_port","arrived_at","departed_at","dwell_hours","call_teu","sla_label"]],
+                fastest[cols_present(fastest, ["name","mmsi","ship_type","route_last_port","arrived_at","departed_at","dwell_hours","call_teu","sla_label"])],
                 use_container_width=True, hide_index=True
             )
         with cB:
             st.caption("Slowest unloads (longest dwell)")
             st.dataframe(
-                slowest[["name","mmsi","ship_type","route_last_port","arrived_at","departed_at","dwell_hours","call_teu","sla_label"]],
+                slowest[cols_present(slowest, ["name","mmsi","ship_type","route_last_port","arrived_at","departed_at","dwell_hours","call_teu","sla_label"])],
                 use_container_width=True, hide_index=True
             )
 
@@ -563,12 +571,13 @@ st.markdown("---")
 st.subheader("Direction Heat — Where do ships come from? (Wind-Rose)")
 
 hist_dir = df_all.copy()
-hist_dir["bearing"] = hist_dir["course_deg"]
+hist_dir["bearing"] = pd.to_numeric(hist_dir.get("course_deg"), errors="coerce")
 card_map = {"N":0,"NE":45,"E":90,"SE":135,"S":180,"SW":225,"W":270,"NW":315}
-mask_no_bearing = hist_dir["bearing"].isna() & hist_dir["direction_cardinal"].notna()
-hist_dir.loc[mask_no_bearing, "bearing"] = hist_dir.loc[mask_no_bearing, "direction_cardinal"].map(lambda c: card_map.get(str(c).upper()))
-
+if "direction_cardinal" in hist_dir.columns:
+    mask_no_bearing = hist_dir["bearing"].isna() & hist_dir["direction_cardinal"].notna()
+    hist_dir.loc[mask_no_bearing, "bearing"] = hist_dir.loc[mask_no_bearing, "direction_cardinal"].map(lambda c: card_map.get(str(c).upper()))
 hist_dir = hist_dir[(hist_dir["status"].isin(["incoming","in_port"])) & hist_dir["bearing"].notna()].copy()
+
 if hist_dir.empty:
     st.info("No direction data yet.")
 else:
@@ -589,7 +598,6 @@ else:
         hist_dir = hist_dir[hist_dir["scraped_at_utc"] >= (now - pd.Timedelta(days=30))]
 
     rose = (hist_dir.groupby("sector", as_index=False).size().rename(columns={"size":"count"}))
-
     if rose.empty:
         st.info("No data in selected window.")
     else:
@@ -603,12 +611,13 @@ else:
 with st.expander("ℹ️ Methodology"):
     st.markdown(f"""
 **Directional Map**
-- Real segments drawn when vessel coordinates are available from detail pages.
-- Fallback: schematic rays using Course° (or cardinal) from detail pages.
+- Shows real segments when lat/lon exist; otherwise schematic rays using Course° or cardinal.
+- In-port ships appear anchored at the port (short stub if position known).
 
 **Port-calls**
-- Count each call once on arrival; dwell until first non-in_port status.
+- Arrival = first time `status == "in_port"` after being away. Count TEU **once** per arrival.
+- Call TEU = max TEU observed while in_port. Weekly/Monthly = sum of call TEU whose **arrival** falls in period.
 
 **Targets & SLA**
-- Annual target = {ANNUAL_TEU_TARGET:,.0f} TEU; SLA = {SLA_HOURS:.0f} h dwell.
+- Annual target = {ANNUAL_TEU_TARGET:,.0f} TEU; SLA threshold = {SLA_HOURS:.0f} hours.
 """)
