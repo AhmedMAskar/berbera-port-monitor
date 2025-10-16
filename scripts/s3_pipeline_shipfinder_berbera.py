@@ -1,11 +1,13 @@
 # scripts/s3_pipeline_shipfinder_berbera.py
 """
-Berbera Port Monitor — VesselFinder → S3 pipeline (with detail-page enrichment)
-Fixes/Improvements:
-- Robust anchor → detail_url mapping by name
-- Add lat/lon extraction (several patterns)
-- Priority: in_port > incoming > expected > outgoing
-- Higher default MAX_DETAIL_VESSELS (40)
+Berbera Port Monitor — VesselFinder → S3 pipeline (detail enrichment + coords)
+- Robust anchor→detail_url mapping by name
+- Fallback detail URLs using IMO/MMSI patterns:
+    https://www.vesselfinder.com/vessels/details/IMO<imo>
+    https://www.vesselfinder.com/vessels/details/MMSI<mmsi>
+- Extract lat/lon from detail pages (multiple patterns)
+- Higher coverage (default MAX_DETAIL_VESSELS=50) and priority:
+    in_port > incoming > expected > outgoing
 """
 
 import os
@@ -30,7 +32,7 @@ S3_BUCKET  = get_env("S3_BUCKET")
 S3_PREFIX  = (get_env("S3_PREFIX") or "berbera").strip().strip("/")
 AWS_REGION = get_env("AWS_REGION") or None
 VF_URL     = get_env("VF_URL") or "https://www.vesselfinder.com/ports/SOBBO001"
-MAX_DETAIL_VESSELS = int(get_env("MAX_DETAIL_VESSELS", "40"))  # polite cap per run
+MAX_DETAIL_VESSELS = int(get_env("MAX_DETAIL_VESSELS", "50"))  # polite cap per run
 
 if not S3_BUCKET:
     raise SystemExit("❌ S3_BUCKET is required.")
@@ -215,8 +217,7 @@ def html_table_to_df(table_html: str) -> pd.DataFrame:
             headers = [td.get_text(strip=True) for td in first_tr.find_all(["th","td"])]
 
     rows = []
-    body_trs = table.find_all("tr")
-    for tr in body_trs:
+    for tr in table.find_all("tr"):
         tds = tr.find_all(["td","th"])
         if not tds:
             continue
@@ -257,8 +258,10 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
         return pd.DataFrame(columns=APP_COLS)
 
     if save_csv_to:
-        try: df.to_csv(save_csv_to, index=False)
-        except Exception: pass
+        try:
+            df.to_csv(save_csv_to, index=False)
+        except Exception:
+            pass
 
     cols = df.columns.tolist()
     name_col  = pick_col(cols, NAME_PATTERNS) or (cols[0] if cols else None)
@@ -278,28 +281,21 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
     # Name & detail_url mapping by anchor text
     if name_col:
         out["name"] = df[name_col].astype(str).str.strip()
-        # Build name -> href map from the raw HTML (align by name text)
         soup = BeautifulSoup(table_html, "html.parser")
         name_to_href: Dict[str, Optional[str]] = {}
         for row in soup.find_all("tr"):
             cells = row.find_all(["td","th"])
             if not cells: continue
-            # try first cell; else search for any anchor
-            target = None
+            a = None
             if len(cells) >= 1:
                 a = cells[0].find("a", href=True)
-                if a:
-                    target = (a.get_text(strip=True), a["href"])
-            if not target:
+            if not a:
                 a = row.find("a", href=True)
-                if a:
-                    target = (a.get_text(strip=True), a["href"])
-            if target:
-                tname = target[0].strip()
-                href = target[1]
+            if a:
+                tname = a.get_text(strip=True)
+                href  = a["href"]
                 if tname and tname not in name_to_href:
                     name_to_href[tname] = href
-        # map by exact name text; fallback None
         out["detail_url"] = out["name"].map(lambda n: name_to_href.get(str(n).strip()))
     else:
         out["name"] = pd.Series([None]*len(df))
@@ -331,31 +327,26 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
     else:
         out["last_port"] = pd.NA
 
-    # ETA
+    # ETA / Speed
     out["eta_to_berbera_utc"] = (coerce_eta(df[eta_col]) if eta_col else pd.NA)
-
-    # Speed
     if speed_col:
         ser = df[speed_col].astype(str).str.extract(r"([0-9]+(?:\.[0-9]+)?)", expand=False)
         out["speed_kn"] = pd.to_numeric(ser, errors="coerce")
     else:
         out["speed_kn"] = pd.NA
 
-    # GT / DWT
+    # GT / DWT / Size / Built
     def _num(series):
         return pd.to_numeric(series.astype(str).str.replace(r"[^\d.]", "", regex=True), errors="coerce")
     out["gt"]  = _num(df[gt_col])  if gt_col  else pd.NA
     out["dwt"] = _num(df[dwt_col]) if dwt_col else pd.NA
 
-    # Size (Length / Beam)
     length_m = pd.Series([pd.NA]*len(df)); beam_m = pd.Series([pd.NA]*len(df))
     if size_col:
         for i, txt in enumerate(df[size_col].astype(str)):
             L, B = parse_size_len_beam(txt)
-            length_m.iloc[i] = L; beam_m.iloc[i]   = B
+            length_m.iloc[i] = L; beam_m.iloc[i] = B
     out["length_m"] = length_m; out["beam_m"] = beam_m
-
-    # Built
     out["built_year"] = _num(df[built_col]) if built_col else pd.NA
 
     # Defaults / housekeeping
@@ -384,20 +375,30 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
         out_df.loc[mask, "mmsi"] = out_df.loc[mask, "name"].fillna("").map(synth_id)
 
     # TEU / TEU-equivalent
-    teu_vals = []
-    for _, r in out_df.iterrows():
-        teu_vals.append(
-            teu_equivalent_for_row(
-                stype=r.get("ship_type"),
-                dwt=r.get("dwt"),
-                gt=r.get("gt"),
-                length_m=r.get("length_m"),
-                beam_m=r.get("beam_m"),
-                lane_meters=None,
-                teu_actual=r.get("teu_capacity_actual"),
-            )
+    out_df["teu_equiv"] = [
+        teu_equivalent_for_row(
+            stype=r.get("ship_type"),
+            dwt=r.get("dwt"),
+            gt=r.get("gt"),
+            length_m=r.get("length_m"),
+            beam_m=r.get("beam_m"),
+            lane_meters=None,
+            teu_actual=r.get("teu_capacity_actual"),
         )
-    out_df["teu_equiv"] = teu_vals
+        for _, r in out_df.iterrows()
+    ]
+
+    # Build missing detail_url from MMSI/IMO patterns (fallback)
+    # We do not have IMO on the table; IMO comes from detail page, so we can only prefill MMSI-based URLs here.
+    if "detail_url" in out_df.columns and "mmsi" in out_df.columns:
+        s = out_df["detail_url"].astype(object)
+        missing = s.isna() | (s.astype(str) == "") | (s.astype(str).str.lower() == "none")
+        if missing.any():
+            # MMSI pattern
+            s.loc[missing & out_df["mmsi"].notna()] = (
+                "https://www.vesselfinder.com/vessels/details/MMSI" + out_df.loc[missing & out_df["mmsi"].notna(), "mmsi"].astype(int).astype(str)
+            )
+        out_df["detail_url"] = s
 
     # reorder & clean
     for c in APP_COLS:
@@ -640,7 +641,7 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
         "lon_deg": lon_deg,
     }
 
-def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 40, per_page_timeout_ms: int = 15000) -> pd.DataFrame:
+def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 50, per_page_timeout_ms: int = 15000) -> pd.DataFrame:
     if df.empty or "detail_url" not in df.columns:
         return df
 
