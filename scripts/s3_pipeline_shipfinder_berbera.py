@@ -1,17 +1,11 @@
 # scripts/s3_pipeline_shipfinder_berbera.py
 """
-Berbera Port Monitor — VesselFinder → S3 pipeline (with detail-page enrichment)
-- Headless Playwright (chromium) w/ webdriver masking.
-- Scrapes main page + tables (and iframes).
-- Builds rows: name, MMSI (or synthetic), type, status, last_port, ETA, speed, GT, DWT, LxB, Built
-- Computes TEU/TEU-equivalent by ship type.
-- Follows up to MAX_DETAIL_VESSELS detail pages to enrich:
-    destination, last_port_detailed (+ ATD), course/heading, direction_cardinal,
-    nav status, position age, draught, flag/IMO/callsign.
-- Writes:
-    s3://{S3_BUCKET}/{S3_PREFIX}/latest/vf_snapshot.csv
-    s3://{S3_BUCKET}/{S3_PREFIX}/history/csv/YYYY/MM/DD/HHmm/vf_snapshot_<UTC>.csv
-    s3://{S3_BUCKET}/{S3_PREFIX}/history/in_port/YYYY/MM/DD/HHmm/in_port_<UTC>.csv
+Berbera Port Monitor — VesselFinder → S3 pipeline (detail-page enrichment)
+- Scrapes main page tables (and iframes) and extracts per-row anchor links.
+- Visits detail pages for priority statuses (in_port, incoming, expected, outgoing).
+- Extracts destination, last_port_detailed, ATD, course, speed, nav status,
+  position age, draught, flag/IMO/callsign, and lat/lon when exposed.
+- Writes latest + history + in_port history (tug-free).
 """
 
 import os
@@ -36,7 +30,7 @@ S3_BUCKET  = get_env("S3_BUCKET")
 S3_PREFIX  = (get_env("S3_PREFIX") or "berbera").strip().strip("/")
 AWS_REGION = get_env("AWS_REGION") or None
 VF_URL     = get_env("VF_URL") or "https://www.vesselfinder.com/ports/SOBBO001"
-MAX_DETAIL_VESSELS = int(get_env("MAX_DETAIL_VESSELS", "10"))  # polite cap per run
+MAX_DETAIL_VESSELS = int(get_env("MAX_DETAIL_VESSELS", "40"))  # ← larger default
 
 if not S3_BUCKET:
     raise SystemExit("❌ S3_BUCKET is required.")
@@ -69,7 +63,8 @@ APP_COLS = [
     # detail-page enrichment
     "detail_url","destination","last_port_detailed","atd_last_port_utc",
     "course_deg","heading_deg","nav_status","direction_cardinal",
-    "position_age_min","draught_m","flag","imo","callsign"
+    "position_age_min","draught_m","flag","imo","callsign",
+    "lat_deg","lon_deg"
 ]
 
 REAL_UA = (
@@ -209,6 +204,7 @@ def html_table_to_df(table_html: str) -> pd.DataFrame:
     if table is None:
         return pd.DataFrame()
 
+    # headers
     headers = []
     thead = table.find("thead")
     if thead:
@@ -219,6 +215,7 @@ def html_table_to_df(table_html: str) -> pd.DataFrame:
         if first_tr:
             headers = [td.get_text(strip=True) for td in first_tr.find_all(["th","td"])]
 
+    # rows (skip header row if it mirrors headers)
     rows = []
     for tr in table.find_all("tr"):
         tds = tr.find_all(["td","th"])
@@ -236,6 +233,28 @@ def html_table_to_df(table_html: str) -> pd.DataFrame:
 
     df = pd.DataFrame(norm_rows, columns=headers)
     df = df.replace("", pd.NA).dropna(how="all")
+
+    # attach row-level anchor HREFs aligned to df order
+    # (find tbody rows if present; else all data rows minus header)
+    hrefs: List[Optional[str]] = []
+    body_rows = table.find("tbody").find_all("tr") if table.find("tbody") else table.find_all("tr")
+    # If first row equals headers, skip it
+    if body_rows and headers and [td.get_text(strip=True).lower() for td in body_rows[0].find_all(["td","th"])] == [h.lower() for h in headers]:
+        body_rows = body_rows[1:]
+    # name column index
+    try:
+        name_idx = list(df.columns).index(pick_col(list(df.columns), NAME_PATTERNS) or df.columns[0])
+    except Exception:
+        name_idx = 0
+    for tr in body_rows[:len(df)]:
+        cells = tr.find_all(["td","th"])
+        href = None
+        if name_idx < len(cells):
+            a = cells[name_idx].find("a", href=True)
+            if a and a.get("href"):
+                href = a["href"]
+        hrefs.append(href)
+    df["__detail_href"] = pd.Series(hrefs[:len(df)])
     return df
 
 def split_name_and_type(raw: str) -> Tuple[str, Optional[str]]:
@@ -281,32 +300,14 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
 
     out: Dict[str, pd.Series] = {}
 
-    # Name + detail_url
-    if name_col:
-        out["name"] = df[name_col].astype(str).str.strip()
-        # recover anchor href by re-parsing raw HTML cells
-        soup = BeautifulSoup(table_html, "html.parser")
-        link_map = []
-        body_rows = soup.find_all("tr")
-        try:
-            name_idx = list(df.columns).index(name_col)
-        except ValueError:
-            name_idx = 0
-        for tr in body_rows:
-            tds = tr.find_all(["td","th"])
-            if not tds:
-                continue
-            href = None
-            if name_idx < len(tds):
-                a = tds[name_idx].find("a", href=True)
-                if a and a.get("href"):
-                    href = a["href"]
-            link_map.append(href)
-        if len(link_map) >= len(df)+1:
-            link_map = link_map[-len(df):]
-        out["detail_url"] = pd.Series(link_map[:len(df)])
+    # Name + detail_url (from __detail_href)
+    out["name"] = df[name_col].astype(str).str.strip() if name_col else pd.Series([None]*len(df))
+    base = "https://www.vesselfinder.com"
+    if "__detail_href" in df.columns:
+        urls = df["__detail_href"].fillna("").astype(str)
+        urls = urls.map(lambda u: base + u if u and u.startswith("/") else (u if u.startswith("http") else None))
+        out["detail_url"] = urls
     else:
-        out["name"] = pd.Series([None]*len(df))
         out["detail_url"] = pd.Series([None]*len(df))
 
     # MMSI
@@ -371,24 +372,16 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
 
     out_df = pd.DataFrame(out)
 
-    # Normalize detail_url to absolute
-    base = "https://www.vesselfinder.com"
-    if "detail_url" in out_df.columns:
-        out_df["detail_url"] = out_df["detail_url"].astype(str)
-        mask_rel = out_df["detail_url"].str.startswith("/")
-        out_df.loc[mask_rel, "detail_url"] = base + out_df.loc[mask_rel, "detail_url"]
-
     # If ship_type unknown but embedded in name, split it
-    if "ship_type" in out_df.columns:
-        mask_unknown = out_df["ship_type"].isna() | (out_df["ship_type"] == "") | (out_df["ship_type"] == "Unknown")
-        if mask_unknown.any():
-            new_names, inferred_types = [], []
-            for n in out_df.loc[mask_unknown, "name"].astype(str):
-                nn, it = split_name_and_type(n)
-                new_names.append(nn)
-                inferred_types.append(it if it else "Unknown")
-            out_df.loc[mask_unknown, "name"] = new_names
-            out_df.loc[mask_unknown, "ship_type"] = inferred_types
+    mask_unknown = out_df["ship_type"].isna() | (out_df["ship_type"] == "") | (out_df["ship_type"] == "Unknown")
+    if mask_unknown.any():
+        new_names, inferred_types = [], []
+        for n in out_df.loc[mask_unknown, "name"].astype(str):
+            nn, it = split_name_and_type(n)
+            new_names.append(nn)
+            inferred_types.append(it if it else "Unknown")
+        out_df.loc[mask_unknown, "name"] = new_names
+        out_df.loc[mask_unknown, "ship_type"] = inferred_types
 
     # MMSI synth if missing
     if out_df["mmsi"].isna().any():
@@ -422,15 +415,12 @@ def parse_table(table_html: str, heading_text: str, save_csv_to: Optional[str] =
     return out_df
 
 # =========================
-# Playwright: capture tables and enrichment pages
+# Playwright: tables + enrichment pages
 # =========================
 def try_click_cookies(page):
     selectors = [
-        "button:has-text('Accept')",
-        "button:has-text('I Agree')",
-        "button:has-text('Agree')",
-        "text=Accept all",
-        "text=Accept All",
+        "button:has-text('Accept')","button:has-text('I Agree')","button:has-text('Agree')",
+        "text=Accept all","text=Accept All",
         "[id*='accept']","[class*='accept']","[aria-label*='accept']",
     ]
     for sel in selectors:
@@ -572,19 +562,6 @@ def cardinal_from_degrees(deg: Optional[float]) -> Optional[str]:
     return dirs[idx]
 
 def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
-    """
-    Parse the vessel detail page using robust text/regex based on typical structure:
-    - Destination / ETA
-    - Course / Speed
-    - Current draught
-    - Navigation Status
-    - Position received ... ago
-    - IMO / MMSI
-    - Callsign
-    - AIS Flag
-    - Length / Beam
-    - Last Port ... ATD: ... UTC
-    """
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True)
 
@@ -593,7 +570,6 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
         return m.group(group).strip() if m else None
 
     destination = rex(r"(?:Destination|DESTINATION)\s+([A-Za-z0-9 ,\-/()]+)")
-
     course_deg = rex(r"Course\s*/\s*Speed\s*([0-9]+(?:\.[0-9]+)?)\s*°", group=1)
     speed_kn   = rex(r"Course\s*/\s*Speed\s*[0-9]+(?:\.[0-9]+)?\s*°\s*/\s*([0-9]+(?:\.[0-9]+)?)\s*kn", group=1)
     course_deg = float(course_deg) if course_deg else None
@@ -623,6 +599,37 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
     callsign = rex(r"Callsign\s*([A-Za-z0-9\-]+)")
     mmsi     = rex(r"IMO\s*/\s*MMSI\s*[0-9]{7,9}\s*/\s*([0-9]{6,10})")
 
+    # Coordinates (multiple strategies)
+    lat_deg = None
+    lon_deg = None
+
+    cand = soup.find(attrs={"data-lat": True, "data-lon": True}) or soup.find(attrs={"data-latitude": True, "data-longitude": True})
+    if cand:
+        try:
+            lat_str = cand.get("data-lat") or cand.get("data-latitude")
+            lon_str = cand.get("data-lon") or cand.get("data-longitude")
+            lat_deg = float(lat_str); lon_deg = float(lon_str)
+        except Exception:
+            pass
+
+    if lat_deg is None or lon_deg is None:
+        m = re.search(r"L\.(?:marker|circle)\(\s*\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]", html)
+        if m:
+            lat_deg = float(m.group(1)); lon_deg = float(m.group(2))
+
+    if lat_deg is None or lon_deg is None:
+        m = re.search(r'"lat(?:itude)?"\s*:\s*(-?\d+(?:\.\d+)?)\s*,\s*"lon(?:gitude)?"\s*:\s*(-?\d+(?:\.\d+)?)', html, re.I)
+        if m:
+            lat_deg = float(m.group(1)); lon_deg = float(m.group(2))
+
+    if lat_deg is None or lon_deg is None:
+        m = re.search(r'([0-9]{1,2}\.\d+)\s*[°]?\s*([NS])[^0-9]+([0-9]{1,3}\.\d+)\s*[°]?\s*([EW])', text, re.I)
+        if m:
+            lat = float(m.group(1)); ns = m.group(2).upper()
+            lon = float(m.group(3)); ew = m.group(4).upper()
+            lat_deg = lat if ns == "N" else -lat
+            lon_deg = lon if ew == "E" else -lon
+
     return {
         "destination": destination,
         "course_deg": course_deg,
@@ -636,16 +643,19 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
         "imo": imo,
         "callsign": callsign,
         "mmsi_from_detail": mmsi,
+        "lat_deg": lat_deg,
+        "lon_deg": lon_deg,
     }
 
 def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 12, per_page_timeout_ms: int = 12000) -> pd.DataFrame:
     if df.empty or "detail_url" not in df.columns:
         return df
 
-    prio = ["in_port","incoming","outgoing","expected"]
+    # Prioritize statuses we care about the most
+    prio = ["in_port","incoming","expected","outgoing"]
     dfc = df.copy()
     dfc["__prio"] = dfc["status"].apply(lambda s: prio.index(s) if s in prio else 99)
-    targets = dfc.dropna(subset=["detail_url"]).sort_values("__prio").head(max_n)
+    targets = dfc.dropna(subset=["detail_url"]).sort_values(["__prio","name"]).head(max_n)
 
     if targets.empty:
         return df
@@ -670,10 +680,6 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 12, per_page_timeout
                 page.wait_for_timeout(600)  # settle
                 html = page.content()
                 info = parse_detail_textual(html)
-
-                course_deg = info["course_deg"]
-                direction_cardinal = cardinal_from_degrees(course_deg) if course_deg is not None else None
-
                 out_rows.append(dict(
                     mmsi=r["mmsi"],
                     detail_url=url,
@@ -683,12 +689,14 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 12, per_page_timeout
                     course_deg=info["course_deg"],
                     heading_deg=None,
                     nav_status=info["nav_status"],
-                    direction_cardinal=direction_cardinal,
+                    direction_cardinal=cardinal_from_degrees(info["course_deg"]) if info["course_deg"] is not None else None,
                     position_age_min=info["position_age_min"],
                     draught_m=info["draught_m"],
                     flag=info["flag"],
                     imo=info["imo"],
                     callsign=info["callsign"],
+                    lat_deg=info["lat_deg"],
+                    lon_deg=info["lon_deg"],
                 ))
                 page.wait_for_timeout(250)
             except Exception:
@@ -704,11 +712,14 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 12, per_page_timeout
     merged = df.merge(extra, on=["mmsi"], how="left", suffixes=("","_det"))
 
     # Prefer detail fields where present
-    for col in ["destination","last_port_detailed","atd_last_port_utc","course_deg","heading_deg",
-                "nav_status","direction_cardinal","position_age_min","draught_m","flag","imo","callsign","detail_url"]:
-        merged[col] = merged[f"{col}_det"].combine_first(merged[col]) if f"{col}_det" in merged.columns else merged[col]
+    for col in ["detail_url","destination","last_port_detailed","atd_last_port_utc","course_deg","heading_deg",
+                "nav_status","direction_cardinal","position_age_min","draught_m","flag","imo","callsign",
+                "lat_deg","lon_deg"]:
+        det = f"{col}_det"
+        if det in merged.columns:
+            merged[col] = merged[det].combine_first(merged[col])
 
-    drop_cols = [c for c in merged.columns if c.endswith("_det")]
+    drop_cols = [c for c in merged.columns if c.endswith("_det")] + ["__prio"]
     merged = merged.drop(columns=drop_cols, errors="ignore")
     return merged
 
