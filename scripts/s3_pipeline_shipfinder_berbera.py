@@ -416,7 +416,13 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
 
     out_df = pd.DataFrame(rows_out).replace({pd.NA: None})
     out_df["synth_id"] = out_df["name"].fillna("").map(synth_id)
-    out_df["status"] = out_df["status"].astype(str).str.strip().lower()
+
+    # 🔧 FIX: use Series.str.lower(), not .lower()
+    if "status" in out_df.columns:
+        out_df["status"] = out_df["status"].astype(str).str.strip().str.lower()
+    else:
+        out_df["status"] = "unknown"
+
     return out_df
 
 def normalize_concat(tables: List[Tuple[str, str]]) -> pd.DataFrame:
@@ -507,7 +513,7 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
         except Exception:
             pass
     if lat_deg is None or lon_deg is None:
-        m = re.search(r'"lat(?:itude)?"\s*:\s*(-?\d+(?:\.\d+)?)\s*,\s*"lon(?:gitude)?"\s*:\s*(-?\d+(?:\.\d+)?)', html, re.I)
+        m = re.search(r'"lat(?:itude)?"\s*:\s*(-?\d+(?:\.\d+)?)\s*,\s*"lon(?:gitude)?"\s*:\s*(-?\d+(?:\.\d+)?)\s*', html, re.I)
         if m:
             lat_deg = float(m.group(1)); lon_deg = float(m.group(2))
     if lat_deg is None or lon_deg is None:
