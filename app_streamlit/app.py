@@ -396,6 +396,119 @@ c6.metric("Monthly vs Target", f"{k['monthly_pct']}%")
 
 fresh_ts = latest_rows["scraped_at_utc"].max() if not latest_rows.empty else None
 st.caption(f"Data freshness: {fresh_ts.isoformat() if fresh_ts is not None else 'n/a'}")
+
+# =========================
+# ⬇️ NEW: TEU Trend (right below KPIs)
+# =========================
+st.markdown(" ")
+c_left, c_right = st.columns([1, 1.25])  # chart on the right
+
+with c_right:
+    st.subheader("TEU Trend — Choose Counting Mode")
+    # Mode: Arrivals (no double count) vs In-Port Snapshot (what was in port)
+    mode = st.radio("Counting Mode", ["Arrivals (no double count)", "In-Port Snapshot"], horizontal=True)
+
+    # Build source for both modes
+    # Common type list
+    type_opts_all = sorted(df_all["ship_type"].dropna().unique())
+    group_mode = st.radio("Group by", ["Daily", "Weekly"], horizontal=True)
+
+    if mode == "Arrivals (no double count)":
+        if port_calls.empty:
+            st.info("No detected arrivals yet. Trend will appear once port-calls are detected.")
+        else:
+            pc = port_calls.copy()
+            pc["ship_type"] = pc["ship_type"].astype(str).str.strip().str.title()
+            pc["arrived_at"] = pd.to_datetime(pc["arrived_at"], errors="coerce", utc=True)
+            pc = pc.dropna(subset=["arrived_at"])
+            pc["arrive_date"] = pc["arrived_at"].dt.date
+            pc["arrive_week"] = pc["arrived_at"].dt.to_period("W").dt.start_time.dt.date
+            pc["call_teu"] = pd.to_numeric(pc["call_teu"], errors="coerce").fillna(0.0)
+
+            type_opts = sorted([t for t in pc["ship_type"].dropna().unique()]) or type_opts_all
+            sel_types = st.multiselect("Ship type(s)", type_opts, default=type_opts)
+
+            if pc["arrive_date"].empty:
+                st.info("No arrival timestamps to chart.")
+            else:
+                min_d = pc["arrive_date"].min(); max_d = pc["arrive_date"].max()
+                d1, d2 = st.date_input("Date range", value=(min_d, max_d), min_value=min_d, max_value=max_d)
+
+                f = pc.copy()
+                if sel_types:
+                    f = f[f["ship_type"].isin(sel_types)]
+                f = f[(f["arrive_date"] >= d1) & (f["arrive_date"] <= d2)]
+
+                if group_mode == "Daily":
+                    g = f.groupby("arrive_date", as_index=False)["call_teu"].sum() \
+                         .rename(columns={"arrive_date":"period","call_teu":"teu"})
+                    title = "TEU by Day — Arrivals (counted once)"
+                else:
+                    g = f.groupby("arrive_week", as_index=False)["call_teu"].sum() \
+                         .rename(columns={"arrive_week":"period","call_teu":"teu"})
+                    title = "TEU by Week — Arrivals (counted once)"
+
+                if not g.empty:
+                    fig = px.bar(g, x="period", y="teu", title=title)
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.download_button(
+                        "⬇️ Download TEU trend CSV",
+                        g.to_csv(index=False).encode("utf-8"),
+                        file_name=f"teu_trend_arrivals_{'daily' if group_mode=='Daily' else 'weekly'}.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.info("No data in the selected filters/date range.")
+    else:
+        # In-Port Snapshot mode (what was in port on each day/week)
+        snap = df_all[df_all["status"]=="in_port"].copy()
+        if snap.empty:
+            st.info("No in-port snapshots yet.")
+        else:
+            snap["scraped_at_utc"] = pd.to_datetime(snap["scraped_at_utc"], errors="coerce", utc=True)
+            snap = snap.dropna(subset=["scraped_at_utc"])
+            snap["ship_type"] = snap["ship_type"].astype(str).str.strip().str.title()
+            snap["teu_equiv"] = pd.to_numeric(snap["teu_equiv"], errors="coerce").fillna(0.0)
+            snap["date"] = snap["scraped_at_utc"].dt.date
+            snap["week"] = snap["scraped_at_utc"].dt.to_period("W").dt.start_time.dt.date
+
+            type_opts = sorted([t for t in snap["ship_type"].dropna().unique()]) or type_opts_all
+            sel_types = st.multiselect("Ship type(s)", type_opts, default=type_opts)
+
+            if snap["date"].empty:
+                st.info("No timestamps to chart.")
+            else:
+                min_d = snap["date"].min(); max_d = snap["date"].max()
+                d1, d2 = st.date_input("Date range", value=(min_d, max_d), min_value=min_d, max_value=max_d, key="snap_dates")
+
+                f = snap.copy()
+                if sel_types:
+                    f = f[f["ship_type"].isin(sel_types)]
+                f = f[(f["date"] >= d1) & (f["date"] <= d2)]
+
+                # To avoid counting the same ship multiple times within a period,
+                # take max TEU per MMSI per period, then sum.
+                if group_mode == "Daily":
+                    tmp = f.groupby(["date","mmsi"], as_index=False)["teu_equiv"].max()
+                    g = tmp.groupby("date", as_index=False)["teu_equiv"].sum().rename(columns={"date":"period","teu_equiv":"teu"})
+                    title = "TEU by Day — In-Port Snapshot"
+                else:
+                    tmp = f.groupby(["week","mmsi"], as_index=False)["teu_equiv"].max()
+                    g = tmp.groupby("week", as_index=False)["teu_equiv"].sum().rename(columns={"week":"period","teu_equiv":"teu"})
+                    title = "TEU by Week — In-Port Snapshot"
+
+                if not g.empty:
+                    fig = px.bar(g, x="period", y="teu", title=title)
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.download_button(
+                        "⬇️ Download TEU trend CSV",
+                        g.to_csv(index=False).encode("utf-8"),
+                        file_name=f"teu_trend_inport_{'daily' if group_mode=='Daily' else 'weekly'}.csv",
+                        mime="text/csv",
+                    )
+                else:
+                    st.info("No data in the selected filters/date range.")
+
 st.markdown("---")
 
 # =========================
@@ -405,6 +518,15 @@ statuses_present = sorted(set(x for x in df_all["status"].dropna().unique() if x
 status = st.selectbox("View", statuses_present, index=0)
 types_all = sorted(df_all["ship_type"].dropna().unique())
 selected_types = st.multiselect("Ship types", types_all, default=types_all)
+
+def compute_latest_rows():
+    if not vf_latest.empty:
+        df = unify_schema(vf_latest.copy()); df = _exclude_tugs(df); df = ensure_teu_equiv(df); df = add_derived_fields(df); return df
+    if not df_all.empty:
+        max_ts = df_all["scraped_at_utc"].max(); return add_derived_fields(df_all[df_all["scraped_at_utc"] == max_ts])
+    return pd.DataFrame()
+
+latest_rows = compute_latest_rows()
 
 latest_df = latest_rows.copy()
 if not latest_df.empty:
