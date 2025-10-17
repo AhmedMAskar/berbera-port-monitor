@@ -1,7 +1,7 @@
 # scripts/s3_pipeline_shipfinder_berbera.py
 """
 Berbera Port Monitor — VesselFinder → S3 pipeline
-(detail-page MMSI/IMO enrichment, link-safe, retries with backoff)
+(detail-page MMSI/IMO enrichment, link-safe, retries with backoff, safe datetime)
 
 - Scrape port tables (main + iframes)
 - From the **Name** column only, capture the **vessel detail hyperlink**
@@ -123,6 +123,18 @@ def now_utc_str() -> str:
 def num_clean(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series.astype(str).str.replace(r"[^\d.]", "", regex=True), errors="coerce")
 
+def to_iso_utc_or_none(txt: Optional[str]) -> Optional[str]:
+    """Parse free-text datetime to 'YYYY-mm-ddTHH:MM:SSZ' or None on failure."""
+    if not txt or not str(txt).strip():
+        return None
+    ts = pd.to_datetime(txt, errors="coerce", utc=True)
+    if ts is pd.NaT or pd.isna(ts):
+        return None
+    try:
+        return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
 def teu_from_dwt(dwt: Optional[float]) -> float:
     return float(dwt) * TEU_PER_TON if dwt and dwt > 0 else 0.0
 
@@ -171,7 +183,6 @@ def heading_to_status(h: str) -> Optional[str]:
 
 def fetch_tables_with_headings(url: str) -> List[Tuple[str, str]]:
     results: List[Tuple[str, str]] = []
-    from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -307,11 +318,13 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
     rows_out = []
     for tr in trs[start_row:]:
         tds = tr.find_all(["td","th"])
-        if not tds: 
+        if not tds:
             continue
-        # pad to width
+        # pad to width with real empty <td> tags
         if len(tds) < len(header_cells):
-            tds = tds + [BeautifulSoup("<td></td>", "html.parser")] * (len(header_cells) - len(tds))
+            for _ in range(len(header_cells) - len(tds)):
+                empty_td = soup.new_tag("td")
+                tds.append(empty_td)
 
         cells_text = [td.get_text(strip=True) for td in tds[:len(header_cells)]]
 
@@ -366,7 +379,7 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
         size_txt = cells_text[idx_size] if idx_size is not None and idx_size < len(cells_text) else None
         built_txt = cells_text[idx_built] if idx_built is not None and idx_built < len(cells_text) else None
 
-        # numerics
+        # numerics (safe)
         speed_kn = None
         if speed_txt:
             m = re.findall(r"([0-9]+(?:\.[0-9]+)?)", speed_txt)
@@ -392,7 +405,7 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
             "mmsi": None,
             "ship_type": (ship_type or "Unknown").strip().title(),
             "last_port": (last_port or None),
-            "eta_to_berbera_utc": pd.to_datetime(eta_txt, errors="coerce", utc=True).strftime("%Y-%m-%dT%H:%M:%SZ") if eta_txt else None,
+            "eta_to_berbera_utc": to_iso_utc_or_none(eta_txt),   # SAFE
             "speed_kn": speed_kn,
             "gt": gt, "dwt": dwt, "length_m": L, "beam_m": B, "built_year": built_year,
             "scraped_at_utc": now_utc_str(),
@@ -419,7 +432,7 @@ def normalize_concat(tables: List[Tuple[str, str]]) -> pd.DataFrame:
         df["name"] = df["name"].astype(str).str.strip()
         df["ship_type"] = df["ship_type"].astype(str).str.strip().str.title()
         df["status"] = df["status"].astype(str).str.strip().str.lower()
-        # dedupe by detail_url (unique anchor), then name/status as tiebreakers
+        # dedupe by detail_url (unique anchor)
         df = df.dropna(subset=["detail_url"]).drop_duplicates(subset=["detail_url"], keep="last")
     return df
 
