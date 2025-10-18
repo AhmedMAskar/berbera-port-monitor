@@ -21,13 +21,12 @@ Env:
   AWS_REGION  (optional)
   VF_URL      (default https://www.vesselfinder.com/ports/SOBBO001)
 
-  MAX_DETAIL_VESSELS        (default 60)   # cap per run
+  MAX_DETAIL_VESSELS        (default 60)
   DETAIL_RETRIES            (default 3)
   DETAIL_BACKOFF_BASE_MS    (default 600)
   DETAIL_BACKOFF_MAX_MS     (default 6000)
   DETAIL_SLEEP_BETWEEN_MS   (default 250)
 """
-
 import os
 import re
 import zlib
@@ -72,21 +71,14 @@ STATUS_FROM_HEADING = {
 }
 
 APP_COLS = [
-    # identity
     "name","mmsi","imo","callsign",
-    # type/status
     "ship_type","status","last_port","destination",
-    # kinematics/physical
     "speed_kn","course_deg","heading_deg","draught_m",
     "gt","dwt","length_m","beam_m","built_year",
-    # timing / provenance
     "eta_to_berbera_utc","atd_last_port_utc","scraped_at_utc","source",
-    # TEU
     "teu_capacity_actual","teu_equiv",
-    # enrichment
     "detail_url","last_port_detailed","nav_status","position_age_min","flag",
     "lat_deg","lon_deg","id_source_imo","id_source_mmsi",
-    # internal helper (not used by app for IDs)
     "synth_id",
 ]
 
@@ -96,8 +88,8 @@ REAL_UA = (
     "Chrome/126.0.0.0 Safari/537.36"
 )
 
-TEU_PER_TON = 1/12.0         # DWT → TEU_equiv for non-container cargo
-K_LxB       = 0.50           # Container TEU ≈ k * L * B
+TEU_PER_TON = 1/12.0
+K_LxB       = 0.50
 INCLUDE_PASSENGER_AS_TEU = False
 
 # =========================
@@ -114,7 +106,6 @@ def put_csv(bucket: str, key: str, csv_bytes: bytes):
     print(f"✅ Uploaded: s3://{bucket}/{key} (no-cache)")
 
 def synth_id(name: str) -> int:
-    """Stable internal id (for debug only). Not exported as MMSI."""
     return 0 if not name else abs(zlib.crc32(name.encode("utf-8")))
 
 def now_utc_str() -> str:
@@ -124,7 +115,6 @@ def num_clean(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series.astype(str).str.replace(r"[^\d.]", "", regex=True), errors="coerce")
 
 def to_iso_utc_or_none(txt: Optional[str]) -> Optional[str]:
-    """Parse free-text datetime to 'YYYY-mm-ddTHH:MM:SSZ' or None on failure."""
     if not txt or not str(txt).strip():
         return None
     ts = pd.to_datetime(txt, errors="coerce", utc=True)
@@ -172,8 +162,16 @@ def teu_equivalent_for_row(stype: str, dwt=None, gt=None, length_m=None, beam_m=
     v = teu_from_gt(gt) or teu_from_dwt(dwt)
     return round(v, 1) if v else 0.0
 
+# === Name/Place normalizer ===
+def _fix_berbera(txt: Optional[str]) -> Optional[str]:
+    if not isinstance(txt, str) or not txt.strip():
+        return txt
+    out = re.sub(r"\bberbera\s*,?\s*somalia\b", "Berbera, Somaliland", txt, flags=re.IGNORECASE)
+    out = re.sub(r"\bberbera\b", "Berbera", out, flags=re.IGNORECASE)
+    return out
+
 # =========================
-# HTML table parsing (take link from Name cell *only*)
+# HTML table parsing (link from Name cell)
 # =========================
 def heading_to_status(h: str) -> Optional[str]:
     h = (h or "").lower().strip()
@@ -225,9 +223,8 @@ def fetch_tables_with_headings(url: str) -> List[Tuple[str, str]]:
         except PWTimeout:
             pass
 
-        # main
+        # main + iframes
         results.extend(_collect_tables_from_context(page))
-        # iframes
         for fr in page.frames:
             if fr == page.main_frame: continue
             try:
@@ -302,7 +299,6 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
     if not header_cells:
         return pd.DataFrame(columns=APP_COLS)
 
-    # normalize header names
     def norm(s): return (s or "").strip().lower()
     name_col_idx = None
     for i, h in enumerate(header_cells):
@@ -311,7 +307,6 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
     if name_col_idx is None:
         return pd.DataFrame(columns=APP_COLS)
 
-    # rows (skip header if duplicated as first row)
     trs = table.find_all("tr")
     start_row = 1 if trs and [td.get_text(strip=True).lower() for td in trs[0].find_all(["th","td"])] == [h.lower() for h in header_cells] else 0
 
@@ -320,7 +315,6 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
         tds = tr.find_all(["td","th"])
         if not tds:
             continue
-        # pad to width with real empty <td> tags
         if len(tds) < len(header_cells):
             for _ in range(len(header_cells) - len(tds)):
                 empty_td = soup.new_tag("td")
@@ -328,7 +322,7 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
 
         cells_text = [td.get_text(strip=True) for td in tds[:len(header_cells)]]
 
-        # vessel hyperlink from the NAME cell only
+        # vessel hyperlink from NAME cell
         name_cell = tds[name_col_idx]
         a = name_cell.find("a", href=True)
         href = a["href"].strip() if a else None
@@ -340,13 +334,10 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
         # IMO from URL, if present
         imo_from_url = None
         if detail_url:
-            m = re.search(r"/IMO\s*([0-9]{7})", detail_url, flags=re.I)
-            if not m:
-                m = re.search(r"imo=([0-9]{7})", detail_url, flags=re.I)
-            if m:
-                imo_from_url = m.group(1)
+            m = re.search(r"/IMO\s*([0-9]{7})", detail_url, flags=re.I) or re.search(r"imo=([0-9]{7})", detail_url, flags=re.I)
+            if m: imo_from_url = m.group(1)
 
-        # index helpers
+        # header index helpers
         def find_idx(patterns):
             for i, h in enumerate(header_cells):
                 for p in patterns:
@@ -371,6 +362,8 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
             last_port = cells_text[idx_from]
         elif idx_to is not None and idx_to < len(cells_text):
             last_port = cells_text[idx_to]
+        # 🔧 normalize Berbera naming
+        last_port = _fix_berbera(last_port)
 
         eta_txt = cells_text[idx_eta] if idx_eta is not None and idx_eta < len(cells_text) else None
         speed_txt = cells_text[idx_speed] if idx_speed is not None and idx_speed < len(cells_text) else None
@@ -379,7 +372,6 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
         size_txt = cells_text[idx_size] if idx_size is not None and idx_size < len(cells_text) else None
         built_txt = cells_text[idx_built] if idx_built is not None and idx_built < len(cells_text) else None
 
-        # numerics (safe)
         speed_kn = None
         if speed_txt:
             m = re.findall(r"([0-9]+(?:\.[0-9]+)?)", speed_txt)
@@ -401,11 +393,11 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
         rows_out.append({
             "name": (name or "").strip(),
             "detail_url": detail_url,
-            "imo": imo_from_url,   # from href if present (MMSI comes from detail body)
+            "imo": imo_from_url,
             "mmsi": None,
             "ship_type": (ship_type or "Unknown").strip().title(),
             "last_port": (last_port or None),
-            "eta_to_berbera_utc": to_iso_utc_or_none(eta_txt),   # SAFE
+            "eta_to_berbera_utc": to_iso_utc_or_none(eta_txt),
             "speed_kn": speed_kn,
             "gt": gt, "dwt": dwt, "length_m": L, "beam_m": B, "built_year": built_year,
             "scraped_at_utc": now_utc_str(),
@@ -417,7 +409,6 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
     out_df = pd.DataFrame(rows_out).replace({pd.NA: None})
     out_df["synth_id"] = out_df["name"].fillna("").map(synth_id)
 
-    # 🔧 FIX: use Series.str.lower(), not .lower()
     if "status" in out_df.columns:
         out_df["status"] = out_df["status"].astype(str).str.strip().str.lower()
     else:
@@ -428,9 +419,7 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
 def normalize_concat(tables: List[Tuple[str, str]]) -> pd.DataFrame:
     if not tables:
         return pd.DataFrame(columns=APP_COLS)
-    frames: List[pd.DataFrame] = []
-    for heading, html in tables:
-        frames.append(parse_table(html, heading))
+    frames: List[pd.DataFrame] = [parse_table(html, heading) for heading, html in tables]
     if not frames:
         return pd.DataFrame(columns=APP_COLS)
     df = pd.concat(frames, ignore_index=True)
@@ -438,7 +427,7 @@ def normalize_concat(tables: List[Tuple[str, str]]) -> pd.DataFrame:
         df["name"] = df["name"].astype(str).str.strip()
         df["ship_type"] = df["ship_type"].astype(str).str.strip().str.title()
         df["status"] = df["status"].astype(str).str.strip().str.lower()
-        # dedupe by detail_url (unique anchor)
+        # dedupe by detail_url
         df = df.dropna(subset=["detail_url"]).drop_duplicates(subset=["detail_url"], keep="last")
     return df
 
@@ -453,7 +442,6 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
         m = re.search(pattern, text, flags)
         return m.group(group).strip() if m else None
 
-    # IDs — primary: voyage text; fallback: JSON-LD; then raw HTML scan
     imo = rex(r"(?:IMO)\s*[/ ]\s*([0-9]{7})", flags=re.I) or rex(r"IMO\s*([0-9]{7})", flags=re.I)
     mmsi = rex(r"(?:MMSI)\s*[/ ]\s*([0-9]{9})", flags=re.I) or rex(r"MMSI\s*([0-9]{9})", flags=re.I)
     id_src_imo = "voyage_text" if imo else None
@@ -465,10 +453,8 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
                 j = script.string or ""
                 m_imo = re.search(r'"IMO"\s*:\s*"([0-9]{7})"', j) or re.search(r'"imo"\s*:\s*"([0-9]{7})"', j, re.I)
                 m_mmsi = re.search(r'"MMSI"\s*:\s*"([0-9]{9})"', j) or re.search(r'"mmsi"\s*:\s*"([0-9]{9})"', j, re.I)
-                if (not imo) and m_imo:
-                    imo = m_imo.group(1); id_src_imo = "jsonld"
-                if (not mmsi) and m_mmsi:
-                    mmsi = m_mmsi.group(1); id_src_mmsi = "jsonld"
+                if (not imo) and m_imo:  imo = m_imo.group(1); id_src_imo = "jsonld"
+                if (not mmsi) and m_mmsi: mmsi = m_mmsi.group(1); id_src_mmsi = "jsonld"
             except Exception:
                 pass
 
@@ -479,7 +465,6 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
         m = re.search(r'\bMMSI\s*([0-9]{9})\b', html, re.I)
         if m: mmsi = m.group(1); id_src_mmsi = id_src_mmsi or "html_fallback"
 
-    # Other voyage/tech fields
     destination = rex(r"(?:Destination|DESTINATION)\s+([A-Za-z0-9 ,\-/()]+)")
     last_port_detailed = rex(r"(?:Last Port|Previous port|From|Origin)\s*([A-Za-z0-9 ,\-/()&]+)")
     atd_last_port_utc  = rex(r"ATD:\s*([A-Za-z0-9: ,\-]+UTC)")
@@ -503,7 +488,6 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
             if d: position_age_min = int(d.group(1))*24*60
             elif h: position_age_min = int(h.group(1))*60
 
-    # Coordinates (several embed patterns)
     lat_deg = lon_deg = None
     cand = soup.find(attrs={"data-lat": True, "data-lon": True}) or soup.find(attrs={"data-latitude": True, "data-longitude": True})
     if cand:
@@ -524,6 +508,10 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
     callsign = rex(r"Callsign\s*([A-Za-z0-9\-]+)")
     flag     = rex(r"(?:AIS Flag|Flag)\s*([A-Za-z &]+)")
 
+    # 🔧 normalize place names here too
+    destination = _fix_berbera(destination)
+    last_port_detailed = _fix_berbera(last_port_detailed)
+
     return {
         "imo": imo, "mmsi": mmsi,
         "id_source_imo": id_src_imo, "id_source_mmsi": id_src_mmsi,
@@ -537,19 +525,17 @@ def _backoff_sleep(attempt: int):
     base = DETAIL_BACKOFF_BASE_MS
     cap  = DETAIL_BACKOFF_MAX_MS
     delay = min(cap, base * (2 ** (attempt - 1)))
-    delay = random.randint(int(delay * 0.5), delay)  # jitter
+    delay = random.randint(int(delay * 0.5), delay)
     time.sleep(delay / 1000.0)
 
 def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 60, per_page_timeout_ms: int = 15000) -> pd.DataFrame:
     if df.empty or "detail_url" not in df.columns:
         return df
 
-    # Prioritize by status
     prio_order = {"in_port":0, "incoming":1, "expected":2, "outgoing":3}
     dfc = df.copy()
     dfc["__prio"] = dfc["status"].map(lambda s: prio_order.get(str(s).lower(), 99))
 
-    # Unique rows by detail_url
     targets = (dfc.dropna(subset=["detail_url"])
                  .sort_values(["__prio","name"])
                  .drop_duplicates(subset=["detail_url"], keep="last")
@@ -587,9 +573,6 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 60, per_page_timeout
                     if attempt < DETAIL_RETRIES:
                         _backoff_sleep(attempt)
                         continue
-                # give up after retries
-
-            # polite throttle between vessels
             if DETAIL_SLEEP_BETWEEN_MS > 0:
                 time.sleep(DETAIL_SLEEP_BETWEEN_MS / 1000.0)
 
@@ -607,7 +590,6 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 60, per_page_timeout
     if "imo" in extra.columns:
         extra.loc[~extra["imo"].astype(str).str.fullmatch(r"\d{7}", na=False), "imo"] = None
 
-    # JOIN ON detail_url (not name!)
     merged = df.merge(extra, on=["detail_url"], how="left", suffixes=("","_det"))
 
     # Prefer detail-page fields
@@ -620,6 +602,11 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 60, per_page_timeout
         det = f"{col}_det"
         if det in merged.columns:
             merged[col] = merged[det].combine_first(merged[col])
+
+    # 🔧 normalize naming on the merged frame too
+    for c in ["destination", "last_port_detailed", "last_port"]:
+        if c in merged.columns:
+            merged[c] = merged[c].map(_fix_berbera)
 
     drop_cols = [c for c in merged.columns if c.endswith("_det")]
     merged = merged.drop(columns=drop_cols, errors="ignore")
@@ -647,6 +634,11 @@ def compute_teu(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def write_outputs(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
+    # final safety: normalize naming before write
+    for c in ["destination","last_port","last_port_detailed"]:
+        if c in df.columns:
+            df[c] = df[c].map(_fix_berbera)
+
     ts = dt.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     latest_key = f"{S3_PREFIX}/latest/vf_snapshot.csv"
     hist_prefix = dt.datetime.utcnow().strftime(f"{S3_PREFIX}/history/csv/%Y/%m/%d/%H%M")
@@ -675,26 +667,18 @@ def write_outputs(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
 # =========================
 def main():
     t0 = time.time()
-
-    # 1) Capture tables
     tables = fetch_tables_with_headings(VF_URL)
     df = normalize_concat(tables)
     print(f"✅ Normalized rows: {len(df)} | cols: {list(df.columns)}")
 
-    # 2) Enrich with detail pages (MMSI/IMO, etc.)
     if not df.empty:
         df = enrich_with_detail_pages(df, max_n=MAX_DETAIL_VESSELS)
-
-    # 3) Compute TEU equivalents
     df = compute_teu(df)
-
-    # 4) Write S3 outputs
     latest_key, hist_key, in_key = write_outputs(df)
     print(f"📝 latest:  s3://{S3_BUCKET}/{latest_key}")
     print(f"🗄️ history: s3://{S3_BUCKET}/{hist_key}")
     if in_key:
         print(f"📦 in-port: s3://{S3_BUCKET}/{in_key}")
-
     print(f"⏱️ Done in {time.time() - t0:.2f}s")
 
 if __name__ == "__main__":
