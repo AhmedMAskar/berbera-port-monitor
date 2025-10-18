@@ -6,7 +6,12 @@
 # - If lat/lon: plot ship point + segment to/from Berbera Somaliland
 # - Else if Last Port / Destination matches PORT_COORDS: draw geodesic from that port
 # - Else: draw bearing ray
-# Also: replace "Berbera Somalia" wording with "Berbera Somaliland"
+# - Distinct styles:
+#     * Incoming (Arrivals): solid green ▶▶▶ (to Berbera)
+#     * Expected: dashed orange ▶▶▶ (to Berbera)
+#     * Outgoing: solid red ◀◀◀ (from Berbera)
+#     * In-Port: solid purple (short berth line / dot)
+# - Optional: heat map of historical in-port origins (density of last ports)
 # ------------------------------------------------------------
 
 import os
@@ -21,7 +26,7 @@ import plotly.express as px
 import boto3
 import folium
 from folium import FeatureGroup
-from folium.plugins import MiniMap
+from folium.plugins import MiniMap, PolyLineTextPath, HeatMap
 
 # =========================
 # Page config & constants
@@ -397,19 +402,17 @@ c6.metric("Monthly vs Target", f"{k['monthly_pct']}%")
 fresh_ts = latest_rows["scraped_at_utc"].max() if not latest_rows.empty else None
 st.caption(f"Data freshness: {fresh_ts.isoformat() if fresh_ts is not None else 'n/a'}")
 
-# =========================
-# ⬇️ NEW: TEU Trend (right below KPIs)
-# =========================
 st.markdown(" ")
-c_left, c_right = st.columns([1, 1.25])  # chart on the right
+
+# =========================
+# TEU Trend (Arrivals vs In-Port Snapshots)
+# =========================
+c_left, c_right = st.columns([1, 1.25])
 
 with c_right:
     st.subheader("TEU Trend — Choose Counting Mode")
-    # Mode: Arrivals (no double count) vs In-Port Snapshot (what was in port)
     mode = st.radio("Counting Mode", ["Arrivals (no double count)", "In-Port Snapshot"], horizontal=True)
 
-    # Build source for both modes
-    # Common type list
     type_opts_all = sorted(df_all["ship_type"].dropna().unique())
     group_mode = st.radio("Group by", ["Daily", "Weekly"], horizontal=True)
 
@@ -460,7 +463,6 @@ with c_right:
                 else:
                     st.info("No data in the selected filters/date range.")
     else:
-        # In-Port Snapshot mode (what was in port on each day/week)
         snap = df_all[df_all["status"]=="in_port"].copy()
         if snap.empty:
             st.info("No in-port snapshots yet.")
@@ -486,8 +488,6 @@ with c_right:
                     f = f[f["ship_type"].isin(sel_types)]
                 f = f[(f["date"] >= d1) & (f["date"] <= d2)]
 
-                # To avoid counting the same ship multiple times within a period,
-                # take max TEU per MMSI per period, then sum.
                 if group_mode == "Daily":
                     tmp = f.groupby(["date","mmsi"], as_index=False)["teu_equiv"].max()
                     g = tmp.groupby("date", as_index=False)["teu_equiv"].sum().rename(columns={"date":"period","teu_equiv":"teu"})
@@ -547,7 +547,7 @@ st.download_button("⬇️ Download CSV",
 st.markdown("---")
 
 # =========================
-# Map helpers
+# Map helpers + layers
 # =========================
 st.subheader("Map — Berbera Somaliland & Vicinity (True/Proxy)")
 
@@ -579,7 +579,6 @@ def port_lookup(name: Optional[str]) -> Optional[Tuple[float,float,str]]:
     if not isinstance(name, str) or not name.strip():
         return None
     key = name.strip().lower()
-    # Try raw, then take first token before comma
     if key in PORT_COORDS:
         lat,lon = PORT_COORDS[key]; return (lat,lon,name)
     key2 = key.split(",")[0].strip()
@@ -587,11 +586,9 @@ def port_lookup(name: Optional[str]) -> Optional[Tuple[float,float,str]]:
         lat,lon = PORT_COORDS[key2]; return (lat,lon,name)
     return None
 
-# =========================
-# Build map
-# =========================
 incoming_df = latest_rows[(latest_rows["status"]=="incoming")].copy()
 outgoing_df = latest_rows[(latest_rows["status"]=="outgoing")].copy()
+expected_df = latest_rows[(latest_rows["status"]=="expected")].copy()
 inport_df   = latest_rows[(latest_rows["status"]=="in_port")].copy()
 
 def get_bearing(row):
@@ -610,81 +607,142 @@ folium.Marker([BERBERA_LAT, BERBERA_LON],
               popup="Berbera Somaliland",
               icon=folium.Icon(color="blue", icon="anchor", prefix="fa")).add_to(m)
 
-fg_in  = FeatureGroup(name="Incoming", show=True)
-fg_out = FeatureGroup(name="Outgoing", show=True)
+# Layers
+fg_in    = FeatureGroup(name="Incoming (Arrivals)", show=True)
+fg_exp   = FeatureGroup(name="Expected (Scheduled)", show=True)
+fg_out   = FeatureGroup(name="Outgoing", show=True)
 fg_berth = FeatureGroup(name="In-Port (berth)", show=True)
+fg_heat  = FeatureGroup(name="Origin Heat (historical in-port)", show=False)
+
+STATUS_COLORS = {
+    "incoming": "#2ca02c",  # green (solid)
+    "expected": "#ff7f0e",  # orange (dashed)
+    "outgoing": "#d62728",  # red (solid)
+    "in_port":  "#9467bd",  # purple (solid)
+}
 
 def add_ship_segment(row, layer, mode: str):
     name = row.get("name","")
     lp   = row.get("route_last_port") or row.get("last_port_detailed") or row.get("last_port") or ""
-    dest = row.get("destination") or ("Berbera Somaliland" if mode in ("incoming","in_port") else "")
+    dest = row.get("destination") or ("Berbera Somaliland" if mode in ("incoming","in_port","expected") else "")
     b    = get_bearing(row)
     lat  = row.get("lat_deg")
     lon  = row.get("lon_deg")
 
-    # text parts
+    color = STATUS_COLORS.get(mode, "#333333")
+
+    # popup text
     b_txt = (f"<br>Bearing: {round(b)}°" if b is not None else "")
     if mode == "incoming":
-        color = "#2ca02c"; pop = f"<b>{name}</b><br>From: {lp}<br>To: {dest}{b_txt}"
+        pop = f"<b>{name}</b><br>From: {lp}<br>To: {dest}{b_txt}"
+        arrow_text = "  ▶  ▶  ▶  "   # -->
+        dashed = False
     elif mode == "outgoing":
-        color = "#d62728"; pop = f"<b>{name}</b><br>To: {dest}{b_txt}"
-    else:
-        color = "#9467bd"; pop = f"<b>{name}</b><br>Status: In port"
+        pop = f"<b>{name}</b><br>To: {dest}{b_txt}"
+        arrow_text = "  ◀  ◀  ◀  "   # <--
+        dashed = False
+    elif mode == "expected":
+        pop = f"<b>{name}</b><br>Status: Expected<br>From: {lp}<br>To: {dest}"
+        arrow_text = "  ▶  ▶  ▶  "   # -->
+        dashed = True
+    else:  # in_port
+        pop = f"<b>{name}</b><br>Status: In port<br>From: {lp or '—'}"
+        arrow_text = ""  # no arrows for berth line
+        dashed = False
 
-    # 1) If we have live lat/lon — draw ship point + true segment
+    def poly_with_arrows(points, dash=False):
+        pl = folium.PolyLine(points, weight=5, opacity=0.9, color=color,
+                             tooltip=name, popup=pop,
+                             dash_array=("8 6" if dash else None))
+        pl.add_to(layer)
+        if arrow_text:
+            PolyLineTextPath(
+                pl, arrow_text, repeat=True, offset=7,
+                attributes={'font-weight': 'bold', 'font-size': '14'}
+            ).add_to(layer)
+
+    # 1) Live lat/lon: draw the true segment
     if pd.notna(lat) and pd.notna(lon):
-        if mode == "incoming":
+        if mode in ("incoming","expected","in_port"):
             pts = [(lat, lon), (BERBERA_LAT, BERBERA_LON)]
         elif mode == "outgoing":
             pts = [(BERBERA_LAT, BERBERA_LON), (lat, lon)]
-        else:
-            pts = [(lat, lon), (BERBERA_LAT, BERBERA_LON)]
-        folium.PolyLine(pts, weight=5, opacity=0.85, color=color, tooltip=name, popup=pop).add_to(layer)
-        folium.CircleMarker(location=(lat, lon), radius=5, tooltip=name, popup=pop, color=color, fill=True).add_to(layer)
+        poly_with_arrows(pts, dash=dashed)
+        folium.CircleMarker(location=(lat, lon), radius=5, tooltip=name, popup=pop,
+                            color=color, fill=True).add_to(layer)
         return
 
-    # 2) No lat/lon — try Last Port / Destination coords
-    if mode in ("incoming","in_port"):
+    # 2) No position: try last port / destination coordinates
+    if mode in ("incoming","expected","in_port"):
         port = port_lookup(lp)
         if port:
             plat, plon, _ = port
             pts = [(plat, plon), (BERBERA_LAT, BERBERA_LON)]
-            brg = initial_bearing(plat, plon, BERBERA_LAT, BERBERA_LON)
-            pop2 = pop + (f"<br>From port bearing: {round(brg)}°")
-            folium.PolyLine(pts, weight=5, opacity=0.85, color=color, tooltip=name, popup=pop2).add_to(layer)
-            folium.CircleMarker(location=(plat, plon), radius=5, tooltip=f"{lp}", popup=f"{lp}", color=color, fill=True).add_to(layer)
+            poly_with_arrows(pts, dash=dashed)
+            folium.CircleMarker(location=(plat, plon), radius=5, tooltip=f"{lp}",
+                                popup=f"{lp}", color=color, fill=True).add_to(layer)
             return
     elif mode == "outgoing":
         port = port_lookup(dest)
         if port:
             dlat, dlon, _ = port
             pts = [(BERBERA_LAT, BERBERA_LON), (dlat, dlon)]
-            brg = initial_bearing(BERBERA_LAT, BERBERA_LON, dlat, dlon)
-            pop2 = pop + (f"<br>To port bearing: {round(brg)}°")
-            folium.PolyLine(pts, weight=5, opacity=0.85, color=color, tooltip=name, popup=pop2).add_to(layer)
-            folium.CircleMarker(location=(dlat, dlon), radius=5, tooltip=f"{dest}", popup=f"{dest}", color=color, fill=True).add_to(layer)
+            poly_with_arrows(pts, dash=dashed)
+            folium.CircleMarker(location=(dlat, dlon), radius=5, tooltip=f"{dest}",
+                                popup=f"{dest}", color=color, fill=True).add_to(layer)
             return
 
-    # 3) Still nothing — draw a schematic ray using bearing (if any)
+    # 3) Still nothing: draw a short bearing ray from Berbera
     if b is not None:
         ray = direction_ray(BERBERA_LAT, BERBERA_LON, b, length_km=75 if mode=="outgoing" else 65)
-        folium.PolyLine(ray, weight=5, opacity=0.7, color=color, tooltip=name, popup=pop,
-                        dash_array="8 6" if mode=="outgoing" else None).add_to(layer)
+        poly_with_arrows(ray, dash=dashed)
     else:
-        # As a last resort, put a berth dot at Berbera Somaliland for in_port
         if mode == "in_port":
-            folium.CircleMarker(location=(BERBERA_LAT, BERBERA_LON), radius=4, tooltip=name, popup=pop, color=color, fill=True).add_to(layer)
+            folium.CircleMarker(location=(BERBERA_LAT, BERBERA_LON), radius=4,
+                                tooltip=name, popup=pop, color=color, fill=True).add_to(layer)
 
+# Draw ship layers
 for _, r in incoming_df.iterrows(): add_ship_segment(r, fg_in,  "incoming")
+for _, r in expected_df.iterrows(): add_ship_segment(r, fg_exp, "expected")
 for _, r in outgoing_df.iterrows(): add_ship_segment(r, fg_out, "outgoing")
 for _, r in inport_df.iterrows():   add_ship_segment(r, fg_berth,"in_port")
 
-fg_in.add_to(m); fg_out.add_to(m); fg_berth.add_to(m)
+# Optional: Heat map of historical in-port origins (density of last ports)
+with st.expander("Heat Layer Options"):
+    show_heat = st.checkbox("Show heat map of historical in-port origins (density of last ports)")
+
+if show_heat:
+    df_in_hist = df_all[(df_all["status"]=="in_port")].copy()
+    if not df_in_hist.empty:
+        df_in_hist = add_derived_fields(df_in_hist)
+        # Map route_last_port to coordinates; weight by TEU or count
+        heat_points = []
+        for _, rr in df_in_hist.iterrows():
+            lp = rr.get("route_last_port") or rr.get("last_port_detailed") or rr.get("last_port")
+            if not lp: 
+                continue
+            port = port_lookup(lp)
+            if port:
+                plat, plon, _ = port
+                w = float(rr.get("teu_equiv") or 1.0)
+                # guard: avoid zeros that hide points
+                heat_points.append([plat, plon, max(w, 1.0)])
+        if heat_points:
+            HeatMap(heat_points, radius=18, blur=22, max_zoom=10, min_opacity=0.3).add_to(fg_heat)
+
+# Add layers & controls
+fg_in.add_to(m)
+fg_exp.add_to(m)
+fg_out.add_to(m)
+fg_berth.add_to(m)
+if show_heat:
+    fg_heat.add_to(m)
+
 MiniMap(toggle_display=True, minimized=True).add_to(m)
-folium.LayerControl(collapsed=True).add_to(m)
+folium.LayerControl(collapsed=False).add_to(m)
 
 st.components.v1.html(m._repr_html_(), height=560, scrolling=False)
-st.caption("Lines use live positions when available; otherwise last known ports or bearings, all anchored to Berbera Somaliland.")
+st.caption("Legend — Incoming (Arrivals): solid green ▶, Expected: dashed orange ▶, Outgoing: solid red ◀, In-port: solid purple. Heat layer shows historical origin density.")
 
 st.markdown("---")
 
@@ -764,10 +822,12 @@ with st.expander("ℹ️ Methodology"):
 - **No position** → try **Last Port/Destination** via internal port coordinates and draw a geodesic.
 - **Still none** → draw a **bearing ray** using Course°/cardinal.
 
-**Detail Pages**
-- If the table lacks a link, we construct:
-  - MMSI URL: `https://www.vesselfinder.com/vessels/details/MMSI<mm si>`
-  - (When available from detail) IMO URL: `https://www.vesselfinder.com/vessels/details/IMO<imo>`
+**Line styles**
+- **Incoming (Arrivals)**: solid green ▶▶▶
+- **Expected**: dashed orange ▶▶▶
+- **Outgoing**: solid red ◀◀◀
+- **In-Port**: solid purple berth/line
+- **Heat layer**: density of **historical last ports** for in-port snapshots.
 
 **Port-calls**
 - Arrival = first `in_port` after away; TEU counted **once** per arrival (max during berth).
