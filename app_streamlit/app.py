@@ -65,7 +65,7 @@ BERBERA_LON = float(st.secrets.get("BERBERA_LON", os.getenv("BERBERA_LON", "45.0
 
 # ---------- Name/Place normalizer ----------
 def fix_berbera(txt: Optional[str]) -> Optional[str]:
-    """Normalize 'Berbera, Somalia' → 'Berbera, Somaliland' and capitalize 'Berbera'."""
+    """Normalize 'Berbera, Somaliland' and capitalize 'Berbera'."""
     if not isinstance(txt, str) or not txt.strip():
         return txt
     out = re.sub(r"\bberbera\s*,?\s*somalia\b", "Berbera, Somaliland", txt, flags=re.IGNORECASE)
