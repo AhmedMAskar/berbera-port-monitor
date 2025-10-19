@@ -764,7 +764,7 @@ MiniMap(toggle_display=True, minimized=True).add_to(m)
 folium.LayerControl(collapsed=False).add_to(m)
 
 st.components.v1.html(m._repr_html_(), height=560, scrolling=False)
-st.caption("Legend — Incoming (Arrivals): solid green ▶, Expected: dashed orange ▶, Outgoing: solid red ◀, In-port: solid purple. Heat layer shows historical origin density. All 'Berbera, Somalia' normalized to 'Berbera, Somaliland'.")
+st.caption("Legend — Incoming (Arrivals): solid green ▶, Expected: dashed orange ▶, Outgoing: solid red ◀, In-port: solid purple. Heat layer shows historical origin density.")
 
 st.markdown("---")
 
