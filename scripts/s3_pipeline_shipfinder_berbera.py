@@ -1,12 +1,32 @@
 # scripts/s3_pipeline_shipfinder_berbera.py
 """
-Berbera Port Monitor — VesselFinder → S3 pipeline (hardened)
-- Fails fast when empty (no silent empty CSVs)
-- Optional DEBUG: save HTML to S3 when tables not found
-- Logs status counts + upload keys
-- Normalizes "Berbera, Somaliland"
-"""
+Berbera Port Monitor — VesselFinder → S3 pipeline
+(detail-page MMSI/IMO enrichment, link-safe, retries with backoff, safe datetime)
 
+- Scrape port tables (main + iframes)
+- From the **Name** column only, capture the **vessel detail hyperlink**
+- Enrich by visiting each detail page (prioritize in_port → incoming → expected → outgoing):
+    * Extract **IMO** from URL when available
+    * Extract **MMSI** and confirm/repair **IMO** from “IMO / MMSI” text & JSON-LD
+    * Pull destination, last/previous port, ATD, course/speed, draught, coords, flag, callsign
+- Compute TEU-equivalent
+- Upload CSVs to S3:
+    s3://{S3_BUCKET}/{S3_PREFIX}/latest/vf_snapshot.csv
+    s3://{S3_BUCKET}/{S3_PREFIX}/history/csv/YYYY/MM/DD/HHmm/vf_snapshot_<UTC>.csv
+    s3://{S3_BUCKET}/{S3_PREFIX}/history/in_port/YYYY/MM/DD/HHmm/in_port_<UTC>.csv
+
+Env:
+  S3_BUCKET   (required)
+  S3_PREFIX   (default 'berbera')
+  AWS_REGION  (optional)
+  VF_URL      (default https://www.vesselfinder.com/ports/SOBBO001)
+
+  MAX_DETAIL_VESSELS        (default 60)
+  DETAIL_RETRIES            (default 3)
+  DETAIL_BACKOFF_BASE_MS    (default 600)
+  DETAIL_BACKOFF_MAX_MS     (default 6000)
+  DETAIL_SLEEP_BETWEEN_MS   (default 250)
+"""
 import os
 import re
 import zlib
@@ -36,9 +56,6 @@ DETAIL_RETRIES           = int(get_env("DETAIL_RETRIES", "3"))
 DETAIL_BACKOFF_BASE_MS   = int(get_env("DETAIL_BACKOFF_BASE_MS", "600"))
 DETAIL_BACKOFF_MAX_MS    = int(get_env("DETAIL_BACKOFF_MAX_MS", "6000"))
 DETAIL_SLEEP_BETWEEN_MS  = int(get_env("DETAIL_SLEEP_BETWEEN_MS", "250"))
-
-ALLOW_EMPTY_UPLOAD       = get_env("ALLOW_EMPTY_UPLOAD", "0") in ("1","true","True")
-DEBUG_SAVE_HTML_TO_S3    = get_env("DEBUG_SAVE_HTML_TO_S3", "0") in ("1","true","True")
 
 if not S3_BUCKET:
     raise SystemExit("❌ S3_BUCKET is required.")
@@ -81,15 +98,12 @@ INCLUDE_PASSENGER_AS_TEU = False
 def s3() -> boto3.client:
     return boto3.client("s3", region_name=AWS_REGION)
 
-def put_bytes(bucket: str, key: str, data: bytes, content_type="text/plain"):
+def put_csv(bucket: str, key: str, csv_bytes: bytes):
     s3().put_object(
-        Bucket=bucket, Key=key, Body=data, ContentType=content_type,
+        Bucket=bucket, Key=key, Body=csv_bytes, ContentType="text/csv",
         CacheControl="no-cache, no-store, max-age=0, must-revalidate",
     )
     print(f"✅ Uploaded: s3://{bucket}/{key} (no-cache)")
-
-def put_csv(bucket: str, key: str, csv_bytes: bytes):
-    put_bytes(bucket, key, csv_bytes, content_type="text/csv")
 
 def synth_id(name: str) -> int:
     return 0 if not name else abs(zlib.crc32(name.encode("utf-8")))
@@ -97,13 +111,19 @@ def synth_id(name: str) -> int:
 def now_utc_str() -> str:
     return dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
+def num_clean(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series.astype(str).str.replace(r"[^\d.]", "", regex=True), errors="coerce")
+
 def to_iso_utc_or_none(txt: Optional[str]) -> Optional[str]:
     if not txt or not str(txt).strip():
         return None
     ts = pd.to_datetime(txt, errors="coerce", utc=True)
     if ts is pd.NaT or pd.isna(ts):
         return None
-    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
 
 def teu_from_dwt(dwt: Optional[float]) -> float:
     return float(dwt) * TEU_PER_TON if dwt and dwt > 0 else 0.0
@@ -142,6 +162,7 @@ def teu_equivalent_for_row(stype: str, dwt=None, gt=None, length_m=None, beam_m=
     v = teu_from_gt(gt) or teu_from_dwt(dwt)
     return round(v, 1) if v else 0.0
 
+# === Name/Place normalizer ===
 def _fix_berbera(txt: Optional[str]) -> Optional[str]:
     if not isinstance(txt, str) or not txt.strip():
         return txt
@@ -150,7 +171,7 @@ def _fix_berbera(txt: Optional[str]) -> Optional[str]:
     return out
 
 # =========================
-# HTML table parsing
+# HTML table parsing (link from Name cell)
 # =========================
 def heading_to_status(h: str) -> Optional[str]:
     h = (h or "").lower().strip()
@@ -192,7 +213,7 @@ def fetch_tables_with_headings(url: str) -> List[Tuple[str, str]]:
             except Exception:
                 pass
 
-        # scroll to trigger lazy content
+        # scroll a bit to trigger lazy content
         for _ in range(6):
             page.mouse.wheel(0, 1400)
             page.wait_for_timeout(650)
@@ -200,10 +221,7 @@ def fetch_tables_with_headings(url: str) -> List[Tuple[str, str]]:
         try:
             page.wait_for_selector("table", state="visible", timeout=8000)
         except PWTimeout:
-            if DEBUG_SAVE_HTML_TO_S3:
-                html_key = f"{S3_PREFIX}/debug/html/{dt.datetime.utcnow():%Y/%m/%d/%H%M}/port_page.html"
-                put_bytes(S3_BUCKET, html_key, page.content().encode("utf-8"), content_type="text/html")
-                print(f"🧪 Saved debug HTML → s3://{S3_BUCKET}/{html_key}")
+            pass
 
         # main + iframes
         results.extend(_collect_tables_from_context(page))
@@ -344,6 +362,7 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
             last_port = cells_text[idx_from]
         elif idx_to is not None and idx_to < len(cells_text):
             last_port = cells_text[idx_to]
+        # 🔧 normalize Berbera naming
         last_port = _fix_berbera(last_port)
 
         eta_txt = cells_text[idx_eta] if idx_eta is not None and idx_eta < len(cells_text) else None
@@ -389,20 +408,26 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
 
     out_df = pd.DataFrame(rows_out).replace({pd.NA: None})
     out_df["synth_id"] = out_df["name"].fillna("").map(synth_id)
-    if not out_df.empty:
-        out_df["ship_type"] = out_df["ship_type"].astype(str).str.strip().str.title()
-        out_df["status"]    = out_df["status"].astype(str).str.strip().str.lower()
+
+    if "status" in out_df.columns:
+        out_df["status"] = out_df["status"].astype(str).str.strip().str.lower()
+    else:
+        out_df["status"] = "unknown"
+
     return out_df
 
 def normalize_concat(tables: List[Tuple[str, str]]) -> pd.DataFrame:
     if not tables:
         return pd.DataFrame(columns=APP_COLS)
     frames: List[pd.DataFrame] = [parse_table(html, heading) for heading, html in tables]
-    frames = [f for f in frames if not f.empty]
     if not frames:
         return pd.DataFrame(columns=APP_COLS)
     df = pd.concat(frames, ignore_index=True)
     if not df.empty:
+        df["name"] = df["name"].astype(str).str.strip()
+        df["ship_type"] = df["ship_type"].astype(str).str.strip().str.title()
+        df["status"] = df["status"].astype(str).str.strip().str.lower()
+        # dedupe by detail_url
         df = df.dropna(subset=["detail_url"]).drop_duplicates(subset=["detail_url"], keep="last")
     return df
 
@@ -483,6 +508,7 @@ def parse_detail_textual(html: str) -> Dict[str, Optional[str]]:
     callsign = rex(r"Callsign\s*([A-Za-z0-9\-]+)")
     flag     = rex(r"(?:AIS Flag|Flag)\s*([A-Za-z &]+)")
 
+    # 🔧 normalize place names here too
     destination = _fix_berbera(destination)
     last_port_detailed = _fix_berbera(last_port_detailed)
 
@@ -557,6 +583,8 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 60, per_page_timeout
         return df
 
     extra = pd.DataFrame(out_rows)
+
+    # validate ID lengths
     if "mmsi" in extra.columns:
         extra.loc[~extra["mmsi"].astype(str).str.fullmatch(r"\d{9}", na=False), "mmsi"] = None
     if "imo" in extra.columns:
@@ -564,6 +592,7 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 60, per_page_timeout
 
     merged = df.merge(extra, on=["detail_url"], how="left", suffixes=("","_det"))
 
+    # Prefer detail-page fields
     prefer_cols = [
         "mmsi","imo","callsign","destination","last_port_detailed","atd_last_port_utc",
         "course_deg","speed_kn","nav_status","position_age_min","draught_m","flag",
@@ -574,6 +603,7 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 60, per_page_timeout
         if det in merged.columns:
             merged[col] = merged[det].combine_first(merged[col])
 
+    # 🔧 normalize naming on the merged frame too
     for c in ["destination", "last_port_detailed", "last_port"]:
         if c in merged.columns:
             merged[c] = merged[c].map(_fix_berbera)
@@ -603,7 +633,8 @@ def compute_teu(df: pd.DataFrame) -> pd.DataFrame:
     df["teu_equiv"] = vals
     return df
 
-def write_outputs(df: pd.DataFrame) -> Tuple[str, Optional[str], Optional[str]]:
+def write_outputs(df: pd.DataFrame) -> Tuple[str, str, Optional[str]]:
+    # final safety: normalize naming before write
     for c in ["destination","last_port","last_port_detailed"]:
         if c in df.columns:
             df[c] = df[c].map(_fix_berbera)
@@ -617,6 +648,7 @@ def write_outputs(df: pd.DataFrame) -> Tuple[str, Optional[str], Optional[str]]:
     put_csv(S3_BUCKET, latest_key, csv_bytes)
     put_csv(S3_BUCKET, hist_key, csv_bytes)
 
+    # in-port (tug-free) dedicated history
     in_key = None
     dfx = df.copy()
     dfx["status"] = dfx["status"].astype(str).str.lower().str.strip()
@@ -636,26 +668,12 @@ def write_outputs(df: pd.DataFrame) -> Tuple[str, Optional[str], Optional[str]]:
 def main():
     t0 = time.time()
     tables = fetch_tables_with_headings(VF_URL)
-    if not tables:
-        print("❌ No tables found on port page.")
-        if not ALLOW_EMPTY_UPLOAD:
-            raise SystemExit(2)
     df = normalize_concat(tables)
-    print(f"✅ Normalized rows: {len(df)}")
-
-    if df.empty:
-        print("❌ Parsed 0 rows from all tables.")
-        if not ALLOW_EMPTY_UPLOAD:
-            raise SystemExit(3)
+    print(f"✅ Normalized rows: {len(df)} | cols: {list(df.columns)}")
 
     if not df.empty:
         df = enrich_with_detail_pages(df, max_n=MAX_DETAIL_VESSELS)
     df = compute_teu(df)
-
-    if not df.empty and "status" in df.columns:
-        counts = df["status"].value_counts(dropna=False).to_dict()
-        print(f"📊 Status counts: {counts}")
-
     latest_key, hist_key, in_key = write_outputs(df)
     print(f"📝 latest:  s3://{S3_BUCKET}/{latest_key}")
     print(f"🗄️ history: s3://{S3_BUCKET}/{hist_key}")
