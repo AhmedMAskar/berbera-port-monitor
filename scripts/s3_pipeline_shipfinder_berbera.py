@@ -1,9 +1,10 @@
 # scripts/s3_pipeline_shipfinder_berbera.py
 """
 Berbera Port Monitor — VesselFinder → S3 pipeline (hardened)
-- Fails fast when empty (so you NOTICE in Actions)
-- Optional DEBUG: save HTML to S3 for troubleshooting
-- Clear status counts + upload keys
+- Fails fast when empty (no silent empty CSVs)
+- Optional DEBUG: save HTML to S3 when tables not found
+- Logs status counts + upload keys
+- Normalizes "Berbera, Somaliland"
 """
 
 import os
@@ -36,7 +37,6 @@ DETAIL_BACKOFF_BASE_MS   = int(get_env("DETAIL_BACKOFF_BASE_MS", "600"))
 DETAIL_BACKOFF_MAX_MS    = int(get_env("DETAIL_BACKOFF_MAX_MS", "6000"))
 DETAIL_SLEEP_BETWEEN_MS  = int(get_env("DETAIL_SLEEP_BETWEEN_MS", "250"))
 
-# ✳ control empty behavior & debug artifacts
 ALLOW_EMPTY_UPLOAD       = get_env("ALLOW_EMPTY_UPLOAD", "0") in ("1","true","True")
 DEBUG_SAVE_HTML_TO_S3    = get_env("DEBUG_SAVE_HTML_TO_S3", "0") in ("1","true","True")
 
@@ -103,10 +103,7 @@ def to_iso_utc_or_none(txt: Optional[str]) -> Optional[str]:
     ts = pd.to_datetime(txt, errors="coerce", utc=True)
     if ts is pd.NaT or pd.isna(ts):
         return None
-    try:
-        return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
-    except Exception:
-        return None
+    return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def teu_from_dwt(dwt: Optional[float]) -> float:
     return float(dwt) * TEU_PER_TON if dwt and dwt > 0 else 0.0
@@ -145,7 +142,6 @@ def teu_equivalent_for_row(stype: str, dwt=None, gt=None, length_m=None, beam_m=
     v = teu_from_gt(gt) or teu_from_dwt(dwt)
     return round(v, 1) if v else 0.0
 
-# === Name/Place normalizer ===
 def _fix_berbera(txt: Optional[str]) -> Optional[str]:
     if not isinstance(txt, str) or not txt.strip():
         return txt
@@ -154,7 +150,7 @@ def _fix_berbera(txt: Optional[str]) -> Optional[str]:
     return out
 
 # =========================
-# HTML table parsing (link from Name cell)
+# HTML table parsing
 # =========================
 def heading_to_status(h: str) -> Optional[str]:
     h = (h or "").lower().strip()
@@ -196,12 +192,11 @@ def fetch_tables_with_headings(url: str) -> List[Tuple[str, str]]:
             except Exception:
                 pass
 
-        # scroll a bit to trigger lazy content
+        # scroll to trigger lazy content
         for _ in range(6):
             page.mouse.wheel(0, 1400)
             page.wait_for_timeout(650)
 
-        # ✳ safeguard: capture HTML if we don't see tables in time
         try:
             page.wait_for_selector("table", state="visible", timeout=8000)
         except PWTimeout:
@@ -349,7 +344,7 @@ def parse_table(table_html: str, heading_text: str) -> pd.DataFrame:
             last_port = cells_text[idx_from]
         elif idx_to is not None and idx_to < len(cells_text):
             last_port = cells_text[idx_to]
-        last_port = _fix_berbera(last_port)  # normalize
+        last_port = _fix_berbera(last_port)
 
         eta_txt = cells_text[idx_eta] if idx_eta is not None and idx_eta < len(cells_text) else None
         speed_txt = cells_text[idx_speed] if idx_speed is not None and idx_speed < len(cells_text) else None
@@ -569,7 +564,6 @@ def enrich_with_detail_pages(df: pd.DataFrame, max_n: int = 60, per_page_timeout
 
     merged = df.merge(extra, on=["detail_url"], how="left", suffixes=("","_det"))
 
-    # Prefer detail-page fields
     prefer_cols = [
         "mmsi","imo","callsign","destination","last_port_detailed","atd_last_port_utc",
         "course_deg","speed_kn","nav_status","position_age_min","draught_m","flag",
@@ -610,7 +604,6 @@ def compute_teu(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def write_outputs(df: pd.DataFrame) -> Tuple[str, Optional[str], Optional[str]]:
-    # normalize naming before write
     for c in ["destination","last_port","last_port_detailed"]:
         if c in df.columns:
             df[c] = df[c].map(_fix_berbera)
@@ -644,11 +637,7 @@ def main():
     t0 = time.time()
     tables = fetch_tables_with_headings(VF_URL)
     if not tables:
-        msg = "❌ No tables found on port page (layout/anti-bot?)."
-        print(msg)
-        if DEBUG_SAVE_HTML_TO_S3:
-            # we already saved page HTML inside fetch if table missing; nothing to do
-            pass
+        print("❌ No tables found on port page.")
         if not ALLOW_EMPTY_UPLOAD:
             raise SystemExit(2)
     df = normalize_concat(tables)
@@ -663,7 +652,6 @@ def main():
         df = enrich_with_detail_pages(df, max_n=MAX_DETAIL_VESSELS)
     df = compute_teu(df)
 
-    # ✳ status counts for logs
     if not df.empty and "status" in df.columns:
         counts = df["status"].value_counts(dropna=False).to_dict()
         print(f"📊 Status counts: {counts}")
