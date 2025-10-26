@@ -2,65 +2,55 @@ name: S3-only VesselFinder scrape (Playwright)
 
 on:
   schedule:
-    - cron: "0 */6 * * *"   # every 6 hours UTC
-  workflow_dispatch:
+    - cron: "13 0,6,12,18 * * *"   # 00:13, 06:13, 12:13, 18:13 UTC
+  workflow_dispatch: {}
 
 permissions:
   contents: read
-  id-token: write   # REQUIRED for OIDC
-
-concurrency:
-  group: vf-s3-playwright
-  cancel-in-progress: false
 
 jobs:
-  scrape:
+  run:
     runs-on: ubuntu-latest
-    env:
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      S3_BUCKET:  ${{ secrets.S3_BUCKET }}
-      S3_PREFIX:  ${{ secrets.S3_PREFIX }}
-      DEBUG_SAVE_HTML_TO_S3: "1"
-      ALLOW_EMPTY_UPLOAD: "0"
+    timeout-minutes: 15
 
     steps:
-      # 1) Pull your repo
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      # 2) 🔍 Add this diagnostic step here (exactly here)
-      - name: Check OIDC token and role secret presence
-        run: |
-          test -n "${{ secrets.AWS_ROLE_TO_ASSUME }}" && echo "AWS_ROLE_TO_ASSUME secret is present" || (echo "Missing AWS_ROLE_TO_ASSUME secret" && exit 1)
-          echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:+present}"
-          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN=${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+present}"
-
-      # 3) Configure AWS credentials (must pass role-to-assume)
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}   # e.g., arn:aws:iam::123456789012:role/GithubOidcRole
-          aws-region: ${{ secrets.AWS_REGION }}
-          role-session-name: github-berbera
+          fetch-depth: 0
 
-      # 4) Optional: confirm we assumed the role
-      - name: Who am I?
-        run: aws sts get-caller-identity
-
-      # 5) Python + Playwright deps
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps (pip + Playwright)
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -m playwright install --with-deps
+          pip install -r scripts/requirements.txt
 
-      # 6) Run your pipeline
-      - name: Run pipeline
-        run: |
-          set -euo pipefail
-          python scripts/s3_pipeline_shipfinder_berbera.py
+      - name: Install Playwright browsers
+        run: python -m playwright install --with-deps chromium
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Scrape VF -> normalize -> upload to S3
+        env:
+          S3_BUCKET:  ${{ secrets.S3_BUCKET }}         # e.g., berbera-port-monitor
+          S3_PREFIX:  ${{ secrets.S3_PREFIX }}         # e.g., berbera
+          AWS_REGION: ${{ secrets.AWS_REGION }}        # e.g., us-east-1
+          VF_URL:     https://www.vesselfinder.com/ports/SOBBO001
+        run: python scripts/s3_pipeline_shipfinder_berbera.py
+
+      - name: Upload scrape artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vf-scrape-artifacts
+          path: scrape_artifacts/*
+          if-no-files-found: ignore
