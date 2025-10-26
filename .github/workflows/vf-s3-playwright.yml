@@ -2,12 +2,17 @@ name: S3-only VesselFinder scrape (Playwright)
 
 on:
   schedule:
-    - cron: "0 */6 * * *"  # every 6 hours (UTC)
+    - cron: "0 */6 * * *"   # every 6 hours (UTC)
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Force scrape even if previous looked fresh"
+        required: false
+        default: "false"
 
 permissions:
   contents: read
-  id-token: write
+  id-token: write   # REQUIRED for OIDC
 
 concurrency:
   group: vf-s3-playwright
@@ -20,9 +25,9 @@ jobs:
       AWS_REGION: ${{ secrets.AWS_REGION }}
       S3_BUCKET:  ${{ secrets.S3_BUCKET }}
       S3_PREFIX:  ${{ secrets.S3_PREFIX }}
-      # optional debug toggles:
       DEBUG_SAVE_HTML_TO_S3: "1"
-      ALLOW_EMPTY_UPLOAD: "0"  # fail if empty
+      ALLOW_EMPTY_UPLOAD: "0"                       # fail if scrape returns 0 rows
+      FORCE_SCRAPE: ${{ github.event.inputs.force || 'false' }}
 
     steps:
       - uses: actions/checkout@v4
@@ -30,8 +35,12 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}   # e.g., arn:aws:iam::123456789012:role/GitHubOIDC-Berbera
           aws-region: ${{ secrets.AWS_REGION }}
+          role-session-name: github-berbera
+
+      - name: Who am I?
+        run: aws sts get-caller-identity
 
       - uses: actions/setup-python@v5
         with:
